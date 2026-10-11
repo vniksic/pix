@@ -70,6 +70,7 @@ type viewport struct {
 
 	// Callbacks into the viewer.
 	onChange   func()               // view state changed (status bar)
+	onOne      func()               // double-click chose 1:1
 	onKey      func(*fyne.KeyEvent) // routed key presses
 	onRune     func(rune)           // routed characters
 	onShortcut func(fyne.Shortcut)  // routed shortcuts
@@ -365,6 +366,13 @@ func (v *viewport) DoubleTapped(e *fyne.PointEvent) {
 	if v.view.Mode == ModeFit {
 		r := v.pxPerPoint()
 		v.view.SetOneAt(float64(e.Position.X)*r, float64(e.Position.Y)*r)
+		if v.onOne != nil {
+			// onOne may hide the status bar and grow the viewport downwards;
+			// pan back so the clicked point stays under the cursor.
+			ox, oy := v.view.OX, v.view.OY
+			v.onOne()
+			v.view.Pan(ox-v.view.OX, oy-v.view.OY)
+		}
 	} else {
 		v.view.SetFit()
 	}

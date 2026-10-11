@@ -20,7 +20,7 @@ GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
 | PageUp, Backspace, Left, p       | previous image                           |
 | Home / End                       | first / last image                       |
 | f                                | toggle fullscreen (enters in fit mode)   |
-| z                                | 1:1 pixels                               |
+| z                                | 1:1 pixels (in fullscreen also hides the status bar until x) |
 | x                                | fit to window                            |
 | + / = / -                        | zoom in / out                            |
 | [ / ]                            | rotate 90° left / right (view only)      |

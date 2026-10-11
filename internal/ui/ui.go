@@ -66,11 +66,13 @@ type viewer struct {
 	list    *sideList
 	sidebar *fyne.Container
 	root    *fyne.Container
+	right   *fyne.Container // viewport with the status bar below it
 	status  *widget.Label
 
 	sidebarOn  bool // windowed-mode preference
 	fsSidebar  bool // sidebar shown while fullscreen (reset on entering)
 	fullscreen bool
+	statusOff  bool // status bar hidden by an explicit 1:1 in fullscreen; cleared by Fit and by (un)fullscreening
 	loadToken  uint64
 	loading    bool
 	loadSlow   bool // loading has taken longer than loadingDelay
@@ -176,7 +178,8 @@ func Run(opts Options) error {
 
 func (u *viewer) build() {
 	u.vp = newViewport()
-	u.vp.onChange = u.updateStatus
+	u.vp.onChange = u.viewChanged
+	u.vp.onOne = u.explicitOne
 	u.vp.onKey = u.typedKey
 	u.vp.onRune = u.typedRune
 	u.vp.onShortcut = u.typedShortcut
@@ -215,8 +218,8 @@ func (u *viewer) build() {
 	u.status.Truncation = fyne.TextTruncateEllipsis
 
 	u.sidebar = container.New(fixedWidth(sidebarWidth), u.list)
-	right := container.NewBorder(nil, u.status, nil, nil, u.vp)
-	u.root = container.NewBorder(nil, nil, u.sidebar, nil, right)
+	u.right = container.NewBorder(nil, u.status, nil, nil, u.vp)
+	u.root = container.NewBorder(nil, nil, u.sidebar, nil, u.right)
 	u.win.SetContent(u.root)
 	u.applySidebar()
 
@@ -493,6 +496,42 @@ func entryLess(a, b scan.Entry, sort scan.Sort) bool {
 
 // ---- status bar ----
 
+// viewChanged runs on every viewport state change. A return to Fit (x,
+// double-click, or an image change resetting free zoom) brings back a
+// status bar hidden by 1:1 in fullscreen.
+func (u *viewer) viewChanged() {
+	if u.statusOff && u.vp.view.Mode == ModeFit {
+		u.statusOff = false
+		u.applyStatusBar()
+	}
+	u.updateStatus()
+}
+
+// explicitOne runs when 1:1 is chosen explicitly (z or double-click). In
+// fullscreen it hides the status bar so the image gets the whole screen.
+// Wheel and +/- zoom never come here, even when they snap to 1:1.
+func (u *viewer) explicitOne() {
+	if u.fullscreen && !u.statusOff {
+		u.statusOff = true
+		u.applyStatusBar()
+	}
+}
+
+// applyStatusBar shows or hides the status bar. The border layout skips a
+// hidden bottom object (and its padding), so the viewport takes the space.
+func (u *viewer) applyStatusBar() {
+	hide := u.fullscreen && u.statusOff
+	if hide != u.status.Visible() {
+		return
+	}
+	if hide {
+		u.status.Hide()
+	} else {
+		u.status.Show()
+	}
+	u.right.Refresh() // re-run the border layout so the viewport resizes
+}
+
 func (u *viewer) updateStatus() {
 	if len(u.entries) == 0 {
 		u.setStatus(joinNonEmpty("no images", u.flash))
@@ -583,6 +622,8 @@ func (u *viewer) toggleSidebar() {
 func (u *viewer) setFullscreen(on bool) {
 	u.fullscreen = on
 	u.fsSidebar = false
+	u.statusOff = false
+	u.applyStatusBar()
 	u.setWindowFullscreen(on)
 	if on {
 		u.vp.view.SetFit()
@@ -684,6 +725,7 @@ func (u *viewer) typedRune(r rune) {
 		u.setFullscreen(!u.fullscreen)
 	case 'z':
 		v.SetOne()
+		u.explicitOne()
 		u.vp.changed()
 	case 'x':
 		v.SetFit()

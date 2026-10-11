@@ -192,7 +192,7 @@ free zoom resets to fit). Rotation resets to 0 on image change.
     PageUp, Backspace, Left, p    previous image
     Home / End                    first / last
     f                             toggle fullscreen; entering fullscreen -> Fit
-    z                             1:1
+    z                             1:1; in fullscreen also hides the status bar (shown again by Fit via x/double-click, or leaving fullscreen)
     x                             Fit
     + / = / -                     zoom in / out (×1.25 steps), around viewport centre
     [ / ]                         rotate 90° CCW / CW (view only), stays in current mode (re-fit if Fit)
