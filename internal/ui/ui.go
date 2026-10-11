@@ -1,0 +1,803 @@
+// Package ui is the Fyne front end of pix: window, viewport, sidebar,
+// status bar, key and mouse handling.
+package ui
+
+import (
+	"errors"
+	"fmt"
+	"image/color"
+	"log"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	"pix/internal/clipboard"
+	"pix/internal/hypr"
+	"pix/internal/imgload"
+	"pix/internal/scan"
+)
+
+// Options configures Run.
+type Options struct {
+	Entries    []scan.Entry
+	Start      int
+	Dir        string // "" for ad-hoc lists (no watching)
+	Sort       scan.Sort
+	Fullscreen bool // start fullscreen
+	Sidebar    bool // sidebar visible at start
+	Loader     *imgload.Loader
+}
+
+const (
+	loadingDelay = 150 * time.Millisecond // keep the old image this long before showing "loading…"
+	flashTime    = 2 * time.Second        // how long transient status messages stay
+
+	hyprRetries    = 5                      // Hyprland fullscreen retries while our window is not mapped yet
+	hyprRetryDelay = 100 * time.Millisecond // pause between those retries
+)
+
+var (
+	shortcutCopyPath = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl | fyne.KeyModifierShift}
+	shortcutCtrlC    = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl}
+)
+
+type viewer struct {
+	opts   Options
+	app    fyne.App
+	win    fyne.Window
+	loader *imgload.Loader
+
+	entries []scan.Entry
+	idx     int
+
+	vp      *viewport
+	list    *sideList
+	sidebar *fyne.Container
+	root    *fyne.Container
+	status  *widget.Label
+
+	sidebarOn  bool // windowed-mode preference
+	fsSidebar  bool // sidebar shown while fullscreen (reset on entering)
+	fullscreen bool
+	loadToken  uint64
+	loading    bool
+	loadSlow   bool // loading has taken longer than loadingDelay
+	loadErr    error
+	flash      string
+	flashToken uint64
+	stopWatch  func()
+	quitting   bool
+
+	// scanSeq numbers rescans as they start (from `r` or the watcher);
+	// applyEntries ignores a listing older than the last one applied.
+	scanSeq     atomic.Uint64
+	scanApplied uint64
+	// pinned is the file named on the command line: kept in the playlist
+	// while it exists even if List would leave it out (hidden, unsniffable).
+	pinned string
+
+	// copies counts clipboard hand-offs in flight; Run waits for them so
+	// quitting right after Ctrl+C does not cut the data off mid-pipe.
+	copies sync.WaitGroup
+	// copyMu guards copyPending and copyBusy: copies run one at a time on
+	// one goroutine, newest request first, so the last press wins.
+	copyMu      sync.Mutex
+	copyPending *copyJob
+	copyBusy    bool
+
+	reqMu      sync.Mutex // guards reqPending and reqBusy (shared with the load goroutine)
+	reqPending *loadReq
+	reqBusy    bool
+
+	// Window fullscreen (see setWindowFullscreen). u.fullscreen is the only
+	// fullscreen flag pix reads; Fyne's stays false on the Hyprland path.
+	hypr       bool          // fullscreen through Hyprland's IPC (Wayland under Hyprland)
+	mapped     bool          // the first frame was drawn, so Hyprland can see the window
+	fyneFS     bool          // the window was last put in fullscreen through Fyne
+	hyprLogged bool          // an IPC failure has been logged
+	fsSeq      atomic.Uint64 // numbers window fullscreen requests; stale ones give up
+	fsMu       sync.Mutex    // one IPC exchange at a time
+}
+
+// Run builds the Fyne app and blocks until the window closes.
+func Run(opts Options) error {
+	if opts.Loader == nil {
+		return fmt.Errorf("ui: no loader")
+	}
+	a := app.NewWithID("pix.viewer")
+	a.Settings().SetTheme(darkTheme{theme.DefaultTheme()})
+
+	u := &viewer{
+		opts:      opts,
+		app:       a,
+		win:       a.NewWindow("pix"),
+		loader:    opts.Loader,
+		entries:   opts.Entries,
+		sidebarOn: opts.Sidebar,
+	}
+	if opts.Dir != "" && opts.Start >= 0 && opts.Start < len(opts.Entries) {
+		u.pinned = opts.Entries[opts.Start].Path
+	}
+	u.build()
+	u.hypr = onWayland && hypr.Available()
+	u.vp.onFirstFrame = func() {
+		u.mapped = true
+		if u.fullscreen && u.hypr && !u.quitting {
+			u.setWindowFullscreen(true) // -fullscreen: deferred until now
+		}
+	}
+
+	u.win.Resize(fyne.NewSize(1200, 800))
+	if opts.Fullscreen {
+		u.setFullscreen(true)
+	}
+	if len(u.entries) > 0 {
+		u.show(opts.Start)
+	} else {
+		u.vp.SetMessage("no images")
+		u.updateStatus()
+	}
+
+	if opts.Dir != "" {
+		stop, err := scan.Watch(opts.Dir, func() {
+			seq := u.scanSeq.Add(1)
+			entries, err := scan.List(opts.Dir, opts.Sort)
+			fyne.Do(func() { u.applyEntries(seq, entries, err) })
+		})
+		if err != nil {
+			log.Printf("pix: watching %s: %v", opts.Dir, err)
+		} else {
+			u.stopWatch = stop
+		}
+	}
+	u.win.SetOnClosed(func() {
+		u.quitting = true
+		if u.stopWatch != nil {
+			u.stopWatch()
+		}
+	})
+
+	u.win.ShowAndRun()
+	u.copies.Wait()
+	return nil
+}
+
+func (u *viewer) build() {
+	u.vp = newViewport()
+	u.vp.onChange = u.updateStatus
+	u.vp.onKey = u.typedKey
+	u.vp.onRune = u.typedRune
+	u.vp.onShortcut = u.typedShortcut
+	u.vp.focusSelf = u.focusViewport
+	u.vp.onFocusOff = func() {
+		// If focus went nowhere (click on the status bar, say), take it back
+		// so Tab keeps reaching us instead of moving focus.
+		fyne.Do(func() {
+			if u.win.Canvas().Focused() == nil && !u.quitting {
+				u.focusViewport()
+			}
+		})
+	}
+
+	u.list = newSideList(
+		func() int { return len(u.entries) },
+		func(id int) string {
+			if id >= 0 && id < len(u.entries) {
+				return u.entries[id].Name
+			}
+			return ""
+		})
+	u.list.onKey = u.typedKey
+	u.list.onRune = u.typedRune
+	u.list.onShortcut = u.typedShortcut
+	u.list.OnSelected = func(id int) {
+		if id != u.idx {
+			u.show(id)
+		}
+		// Give keyboard focus back to the viewport after a click.
+		u.focusViewport()
+	}
+
+	u.status = widget.NewLabel("")
+	u.status.SizeName = theme.SizeNameCaptionText
+	u.status.Truncation = fyne.TextTruncateEllipsis
+
+	u.sidebar = container.New(fixedWidth(sidebarWidth), u.list)
+	right := container.NewBorder(nil, u.status, nil, nil, u.vp)
+	u.root = container.NewBorder(nil, nil, u.sidebar, nil, right)
+	u.win.SetContent(u.root)
+	u.applySidebar()
+
+	c := u.win.Canvas()
+	// Canvas-level fallbacks for when nothing is focused.
+	c.SetOnTypedKey(func(e *fyne.KeyEvent) { u.typedKey(e); u.focusViewport() })
+	c.SetOnTypedRune(func(r rune) { u.typedRune(r); u.focusViewport() })
+	// Ctrl+C arrives as fyne.ShortcutCopy from the GLFW driver; register the
+	// desktop.CustomShortcut form too in case another driver reports that.
+	c.AddShortcut(&fyne.ShortcutCopy{}, u.typedShortcut)
+	c.AddShortcut(shortcutCtrlC, u.typedShortcut)
+	c.AddShortcut(shortcutCopyPath, u.typedShortcut)
+	u.focusViewport()
+}
+
+func (u *viewer) focusViewport() {
+	if u.quitting {
+		return
+	}
+	if c := u.win.Canvas(); c.Focused() != fyne.Focusable(u.vp) {
+		c.Focus(u.vp)
+	}
+}
+
+// ---- navigation ----
+
+func (u *viewer) show(i int) {
+	if len(u.entries) == 0 {
+		return
+	}
+	i = max(0, min(i, len(u.entries)-1))
+	u.idx = i
+	e := u.entries[i]
+	u.win.SetTitle(e.Name)
+	u.syncList()
+
+	u.loadToken++
+	tok := u.loadToken
+	u.loading, u.loadSlow = true, false
+	u.loadErr = nil
+	u.updateStatus()
+
+	var pre []string
+	for _, j := range []int{i + 1, i - 1, i + 2} {
+		if j >= 0 && j < len(u.entries) {
+			pre = append(pre, u.entries[j].Path)
+		}
+	}
+	u.requestLoad(&loadReq{tok: tok, entry: e, prefetch: pre})
+	time.AfterFunc(loadingDelay, func() {
+		fyne.Do(func() {
+			if tok == u.loadToken && u.loading {
+				u.loadSlow = true
+				u.vp.SetMessage("loading " + e.Name + " …")
+				u.updateStatus()
+			}
+		})
+	})
+}
+
+// loadReq asks the load goroutine to decode one entry.
+type loadReq struct {
+	tok      uint64
+	entry    scan.Entry
+	prefetch []string
+}
+
+// requestLoad hands r to the single load goroutine. Requests coalesce: when
+// paging faster than images decode, only the newest pending one is decoded
+// next, so holding PageDown never piles up concurrent decodes.
+func (u *viewer) requestLoad(r *loadReq) {
+	u.reqMu.Lock()
+	u.reqPending = r
+	if u.reqBusy {
+		u.reqMu.Unlock()
+		return
+	}
+	u.reqBusy = true
+	u.reqMu.Unlock()
+	go u.loadLoop()
+}
+
+func (u *viewer) loadLoop() {
+	for {
+		u.reqMu.Lock()
+		r := u.reqPending
+		u.reqPending = nil
+		if r == nil {
+			u.reqBusy = false
+			u.reqMu.Unlock()
+			return
+		}
+		u.reqMu.Unlock()
+
+		e := r.entry
+		img, err := u.loader.Get(e.Path)
+		if err == nil && img == nil {
+			err = errors.New("no image")
+		}
+		opaque := err == nil && img.Opaque()
+
+		u.reqMu.Lock()
+		superseded := u.reqPending != nil
+		u.reqMu.Unlock()
+		if !superseded {
+			// Prefetch only after the current image, so it never waits behind them.
+			u.loader.Prefetch(r.prefetch...)
+		}
+		fyne.Do(func() {
+			if r.tok != u.loadToken {
+				return
+			}
+			u.loading, u.loadSlow = false, false
+			if err != nil {
+				u.loadErr = err
+				u.vp.SetMessage("cannot show " + e.Name + ": " + err.Error())
+			} else {
+				u.vp.SetImage(img, opaque)
+			}
+			u.updateStatus()
+		})
+	}
+}
+
+// syncList selects the current entry in the sidebar and scrolls to it.
+func (u *viewer) syncList() {
+	u.list.Select(u.idx)
+	u.list.ScrollTo(u.idx)
+}
+
+func (u *viewer) step(d int) {
+	if len(u.entries) == 0 {
+		return
+	}
+	j := u.idx + d
+	if j < 0 || j >= len(u.entries) {
+		return
+	}
+	u.show(j)
+}
+
+// ---- rescanning ----
+
+// rescan re-reads the directory (or re-stats an ad-hoc list) off the main
+// goroutine and applies the result.
+func (u *viewer) rescan() {
+	dir, sort := u.opts.Dir, u.opts.Sort
+	seq := u.scanSeq.Add(1)
+	if dir == "" {
+		old := append([]scan.Entry(nil), u.entries...)
+		go func() {
+			var out []scan.Entry
+			for _, e := range old {
+				fi, err := os.Stat(e.Path)
+				if err != nil || fi.IsDir() {
+					continue
+				}
+				e.ModTime, e.Size = fi.ModTime(), fi.Size()
+				out = append(out, e)
+			}
+			fyne.Do(func() { u.applyEntries(seq, out, nil) })
+		}()
+		return
+	}
+	go func() {
+		entries, err := scan.List(dir, sort)
+		fyne.Do(func() { u.applyEntries(seq, entries, err) })
+	}()
+}
+
+// applyEntries installs a fresh listing from rescan number seq, keeping the
+// current file selected by path and invalidating cached decodes of files
+// that changed. Listings finishing after a newer one are dropped.
+func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
+	if u.quitting || seq <= u.scanApplied {
+		return
+	}
+	u.scanApplied = seq
+	if err != nil {
+		u.flashMsg("rescan: " + err.Error())
+		return
+	}
+	if u.opts.Dir != "" {
+		entries = withPinned(entries, u.pinned, u.opts.Sort)
+	}
+	curPath := ""
+	if u.idx >= 0 && u.idx < len(u.entries) {
+		curPath = u.entries[u.idx].Path
+	}
+	old := make(map[string]scan.Entry, len(u.entries))
+	for _, e := range u.entries {
+		old[e.Path] = e
+	}
+	reload := false
+	newIdx := -1
+	listed := make(map[string]bool, len(entries))
+	for i, e := range entries {
+		listed[e.Path] = true
+		if o, ok := old[e.Path]; ok && (!o.ModTime.Equal(e.ModTime) || o.Size != e.Size) {
+			u.loader.Invalidate(e.Path)
+			if e.Path == curPath {
+				reload = true
+			}
+		}
+		if e.Path == curPath {
+			newIdx = i
+		}
+	}
+	// A path that left the listing may later return with other content;
+	// drop its cached decode (or error) so that is never shown.
+	for p := range old {
+		if !listed[p] {
+			u.loader.Invalidate(p)
+		}
+	}
+	if newIdx < 0 {
+		reload = true
+		newIdx = max(0, min(u.idx, len(entries)-1))
+	}
+	u.entries = entries
+	u.list.UnselectAll()
+	u.list.Refresh()
+
+	if len(entries) == 0 {
+		u.idx = 0
+		u.loadToken++
+		u.loading, u.loadSlow = false, false
+		u.loadErr = nil
+		u.win.SetTitle("pix")
+		u.vp.SetMessage("no images")
+		u.updateStatus()
+		return
+	}
+	if reload {
+		u.show(newIdx)
+		return
+	}
+	u.idx = newIdx
+	u.syncList()
+	u.updateStatus()
+}
+
+// withPinned returns entries with the file at path inserted at its sorted
+// position if it is missing from the listing but still exists.
+func withPinned(entries []scan.Entry, path string, sort scan.Sort) []scan.Entry {
+	if path == "" || slices.ContainsFunc(entries, func(e scan.Entry) bool { return e.Path == path }) {
+		return entries
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return entries
+	}
+	p := scan.Entry{Path: path, Name: filepath.Base(path), ModTime: fi.ModTime(), Size: fi.Size()}
+	i := slices.IndexFunc(entries, func(e scan.Entry) bool { return entryLess(p, e, sort) })
+	if i < 0 {
+		i = len(entries)
+	}
+	return slices.Insert(entries, i, p)
+}
+
+// entryLess orders entries the way scan.List sorts them.
+func entryLess(a, b scan.Entry, sort scan.Sort) bool {
+	if sort == scan.SortMTime && !a.ModTime.Equal(b.ModTime) {
+		return a.ModTime.Before(b.ModTime)
+	}
+	switch {
+	case scan.NaturalLess(a.Name, b.Name):
+		return true
+	case scan.NaturalLess(b.Name, a.Name):
+		return false
+	}
+	return a.Path < b.Path
+}
+
+// ---- status bar ----
+
+func (u *viewer) updateStatus() {
+	if len(u.entries) == 0 {
+		u.setStatus(joinNonEmpty("no images", u.flash))
+		return
+	}
+	e := u.entries[u.idx]
+	parts := []string{e.Name, fmt.Sprintf("%d/%d", u.idx+1, len(u.entries))}
+	switch {
+	case u.loading:
+		if u.loadSlow {
+			parts = append(parts, "loading…")
+		}
+	case u.loadErr != nil:
+		parts = append(parts, "error: "+u.loadErr.Error())
+	case u.vp.img != nil:
+		b := u.vp.img.Bounds()
+		parts = append(parts, fmt.Sprintf("%d×%d", b.Dx(), b.Dy()), fmt.Sprintf("%d%%", u.vp.view.Percent()))
+		if r := u.vp.view.Rot; r != 0 {
+			parts = append(parts, fmt.Sprintf("↻%d°", r*90))
+		}
+	}
+	if u.flash != "" {
+		parts = append(parts, u.flash)
+	}
+	u.setStatus(strings.Join(parts, "   "))
+}
+
+func joinNonEmpty(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, "   ")
+}
+
+func (u *viewer) setStatus(s string) {
+	if u.status.Text != s {
+		u.status.SetText(s)
+	}
+}
+
+// flashMsg shows a transient message in the status bar.
+func (u *viewer) flashMsg(msg string) {
+	u.flash = msg
+	u.flashToken++
+	tok := u.flashToken
+	u.updateStatus()
+	time.AfterFunc(flashTime, func() {
+		fyne.Do(func() {
+			if tok == u.flashToken {
+				u.flash = ""
+				u.updateStatus()
+			}
+		})
+	})
+}
+
+// ---- sidebar / fullscreen ----
+
+func (u *viewer) applySidebar() {
+	on := u.sidebarOn
+	if u.fullscreen {
+		on = u.fsSidebar
+	}
+	if on {
+		u.sidebar.Show()
+		u.list.ScrollTo(u.idx)
+	} else {
+		u.sidebar.Hide()
+	}
+	if u.root != nil {
+		u.root.Refresh() // re-run the border layout so the viewport resizes
+	}
+}
+
+func (u *viewer) toggleSidebar() {
+	if u.fullscreen {
+		u.fsSidebar = !u.fsSidebar
+	} else {
+		u.sidebarOn = !u.sidebarOn
+	}
+	u.applySidebar()
+	u.focusViewport()
+}
+
+func (u *viewer) setFullscreen(on bool) {
+	u.fullscreen = on
+	u.fsSidebar = false
+	u.setWindowFullscreen(on)
+	if on {
+		u.vp.view.SetFit()
+	}
+	u.applySidebar()
+	u.vp.changed()
+}
+
+// setWindowFullscreen puts the window itself in or out of fullscreen.
+//
+// Fyne fullscreens on the monitor it thinks the window is on, which on
+// Wayland is always the primary one (a Wayland window has no global
+// position). Under Hyprland we ask the compositor instead, which keeps the
+// window on its current monitor; GLFW sees that as an ordinary configure
+// and resize. Hyprland can only act on a mapped window, so before the first
+// frame this does nothing and the first frame catches up. If the IPC fails,
+// Fyne does it after all.
+func (u *viewer) setWindowFullscreen(on bool) {
+	if !u.hypr || (!on && u.fyneFS) {
+		u.fyneFullscreen(on)
+		return
+	}
+	if !u.mapped {
+		return
+	}
+	seq := u.fsSeq.Add(1)
+	pid := os.Getpid()
+	go func() {
+		u.fsMu.Lock()
+		defer u.fsMu.Unlock()
+		var err error
+		for try := 0; ; try++ {
+			if u.fsSeq.Load() != seq {
+				return // a newer request replaces this one
+			}
+			err = hypr.SetFullscreen(pid, on)
+			if !errors.Is(err, hypr.ErrNoWindow) || try >= hyprRetries {
+				break
+			}
+			time.Sleep(hyprRetryDelay) // window not mapped (or not known) yet
+		}
+		if err == nil {
+			return
+		}
+		fyne.Do(func() {
+			if u.fsSeq.Load() != seq || u.quitting {
+				return
+			}
+			if !u.hyprLogged {
+				u.hyprLogged = true
+				log.Printf("pix: Hyprland fullscreen failed, falling back to Fyne: %v", err)
+			}
+			u.fyneFullscreen(on)
+		})
+	}()
+}
+
+func (u *viewer) fyneFullscreen(on bool) {
+	u.fyneFS = on
+	u.win.SetFullScreen(on)
+}
+
+func (u *viewer) quit() {
+	u.quitting = true
+	u.win.Close()
+}
+
+// ---- keys ----
+
+func (u *viewer) typedKey(e *fyne.KeyEvent) {
+	switch e.Name {
+	case fyne.KeyPageDown, fyne.KeySpace, fyne.KeyRight:
+		u.step(1)
+	case fyne.KeyPageUp, fyne.KeyBackspace, fyne.KeyLeft:
+		u.step(-1)
+	case fyne.KeyHome:
+		u.show(0)
+	case fyne.KeyEnd:
+		u.show(len(u.entries) - 1)
+	case fyne.KeyTab:
+		u.toggleSidebar()
+	case fyne.KeyEscape:
+		if u.fullscreen {
+			u.setFullscreen(false)
+		} else {
+			u.quit()
+		}
+	}
+}
+
+func (u *viewer) typedRune(r rune) {
+	v := &u.vp.view
+	switch unicode.ToLower(r) {
+	case 'n':
+		u.step(1)
+	case 'p':
+		u.step(-1)
+	case 'f':
+		u.setFullscreen(!u.fullscreen)
+	case 'z':
+		v.SetOne()
+		u.vp.changed()
+	case 'x':
+		v.SetFit()
+		u.vp.changed()
+	case '+', '=':
+		v.ZoomBy(KeyStep, v.VW/2, v.VH/2)
+		u.vp.changed()
+	case '-':
+		v.ZoomBy(1/KeyStep, v.VW/2, v.VH/2)
+		u.vp.changed()
+	case '[':
+		v.Rotate(-1)
+		u.vp.changed()
+	case ']':
+		v.Rotate(1)
+		u.vp.changed()
+	case 'b':
+		u.toggleSidebar()
+	case 'r':
+		u.rescan()
+	case 'q':
+		u.quit()
+	}
+}
+
+func (u *viewer) typedShortcut(s fyne.Shortcut) {
+	switch s.ShortcutName() {
+	case (&fyne.ShortcutCopy{}).ShortcutName(), shortcutCtrlC.ShortcutName():
+		u.copyImage()
+	case shortcutCopyPath.ShortcutName():
+		u.copyPath()
+	}
+}
+
+// ---- clipboard ----
+
+// copyJob is one clipboard hand-off; ok is flashed when it succeeds.
+type copyJob struct {
+	run func() error
+	ok  string
+}
+
+func (u *viewer) copyImage() {
+	img, rot := u.vp.img, u.vp.view.Rot
+	if img == nil {
+		u.flashMsg("nothing to copy")
+		return
+	}
+	u.requestCopy(&copyJob{run: func() error { return clipboard.CopyImage(RotateNRGBA(img, rot)) }, ok: "copied"})
+}
+
+func (u *viewer) copyPath() {
+	if len(u.entries) == 0 {
+		return
+	}
+	p := u.entries[u.idx].Path
+	u.requestCopy(&copyJob{run: func() error { return clipboard.CopyText(p) }, ok: "copied path"})
+}
+
+// requestCopy queues j on the single copy goroutine. A request still
+// waiting when a newer one arrives is dropped: the last press wins, and only
+// its outcome is flashed.
+func (u *viewer) requestCopy(j *copyJob) {
+	u.copies.Add(1)
+	u.copyMu.Lock()
+	if u.copyPending != nil {
+		u.copies.Done() // superseded before it started
+	}
+	u.copyPending = j
+	if u.copyBusy {
+		u.copyMu.Unlock()
+		return
+	}
+	u.copyBusy = true
+	u.copyMu.Unlock()
+	go u.copyLoop()
+}
+
+func (u *viewer) copyLoop() {
+	for {
+		u.copyMu.Lock()
+		j := u.copyPending
+		u.copyPending = nil
+		if j == nil {
+			u.copyBusy = false
+			u.copyMu.Unlock()
+			return
+		}
+		u.copyMu.Unlock()
+
+		err := j.run()
+		u.copyMu.Lock()
+		superseded := u.copyPending != nil
+		u.copyMu.Unlock()
+		u.copies.Done()
+		if superseded {
+			continue // a newer copy replaces this one on the clipboard
+		}
+		fyne.Do(func() {
+			if u.quitting {
+				return
+			}
+			if err != nil {
+				u.flashMsg("copy failed: " + err.Error())
+			} else {
+				u.flashMsg(j.ok)
+			}
+		})
+	}
+}
+
+// darkTheme forces the dark variant of the default theme.
+type darkTheme struct{ fyne.Theme }
+
+func (t darkTheme) Color(n fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
+	return t.Theme.Color(n, theme.VariantDark)
+}

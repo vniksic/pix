@@ -1,0 +1,4 @@
+pix
+*.png
+*.jpg
+/dist/
