@@ -5,6 +5,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -19,6 +20,7 @@ type sideList struct {
 	widget.List
 
 	onKey      func(*fyne.KeyEvent)
+	onKeyDown  func(*fyne.KeyEvent)
 	onRune     func(rune)
 	onShortcut func(fyne.Shortcut)
 }
@@ -27,14 +29,19 @@ var (
 	_ fyne.Focusable    = (*sideList)(nil)
 	_ fyne.Tabbable     = (*sideList)(nil)
 	_ fyne.Shortcutable = (*sideList)(nil)
+	_ desktop.Keyable   = (*sideList)(nil)
 )
+
+// markPrefix is shown before the name of a marked entry.
+const markPrefix = "★ "
 
 // newSideList lists label(i) for each entry. With twoLine, every row has
 // room for a second, smaller and dimmer line showing the label's directory
 // part under the file name (rows keep one fixed height; a label without a
 // directory part gets its name centred). Without it, rows are one line and
-// show only the file name.
-func newSideList(length func() int, label func(int) string, twoLine bool) *sideList {
+// show only the file name. Names of entries for which marked(i) is true get
+// a leading star.
+func newSideList(length func() int, label func(int) string, marked func(int) bool, twoLine bool) *sideList {
 	l := &sideList{}
 	l.Length = length
 	l.CreateItem = func() fyne.CanvasObject {
@@ -51,6 +58,9 @@ func newSideList(length func() int, label func(int) string, twoLine bool) *sideL
 	}
 	l.UpdateItem = func(id widget.ListItemID, o fyne.CanvasObject) {
 		name, dir := splitLabel(label(id))
+		if marked(id) {
+			name = markPrefix + name
+		}
 		c, ok := o.(*fyne.Container)
 		if !ok {
 			o.(*widget.Label).SetText(name)
@@ -130,6 +140,14 @@ func (l *sideList) TypedKey(e *fyne.KeyEvent) {
 		l.onKey(e)
 	}
 }
+
+func (l *sideList) KeyDown(e *fyne.KeyEvent) {
+	if l.onKeyDown != nil {
+		l.onKeyDown(e)
+	}
+}
+
+func (l *sideList) KeyUp(*fyne.KeyEvent) {}
 
 func (l *sideList) TypedRune(r rune) {
 	if l.onRune != nil {

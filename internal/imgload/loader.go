@@ -13,7 +13,7 @@ import (
 type Loader struct {
 	capacity int
 	workers  int
-	decode   func(string) (*image.NRGBA, error) // Decode; replaced in tests
+	decode   func(string) (*image.NRGBA, error) // tests only: replaces decodeWithMeta (Meta then zero)
 
 	mu      sync.Mutex
 	entries map[string]*entry // queued, decoding and finished
@@ -41,6 +41,7 @@ type entry struct {
 	state entryState
 	done  chan struct{} // closed when finished
 	img   *image.NRGBA
+	meta  Meta
 	err   error
 	elem  *list.Element // position in lru once finished and cached
 }
@@ -60,7 +61,6 @@ func NewLoader(capacity, workers int) *Loader {
 	return &Loader{
 		capacity: max(capacity, 1),
 		workers:  max(workers, 1),
-		decode:   Decode,
 		entries:  make(map[string]*entry),
 		lru:      list.New(),
 		budget:   DefaultByteBudget,
@@ -85,6 +85,14 @@ func (l *Loader) SetByteBudget(n int64) {
 // decode. If it is only queued, Get takes it over and decodes it on the
 // calling goroutine instead of waiting behind other prefetches.
 func (l *Loader) Get(path string) (*image.NRGBA, error) {
+	img, _, err := l.GetMeta(path)
+	return img, err
+}
+
+// GetMeta is Get that also returns the image's Meta. Meta is extracted
+// from the same file read as the pixels and cached with the image, so it
+// costs nothing extra.
+func (l *Loader) GetMeta(path string) (*image.NRGBA, Meta, error) {
 	l.mu.Lock()
 	e := l.entries[path]
 	run := false
@@ -106,7 +114,7 @@ func (l *Loader) Get(path string) (*image.NRGBA, error) {
 	} else {
 		<-e.done
 	}
-	return e.img, e.err
+	return e.img, e.meta, e.err
 }
 
 // Prefetch schedules decodes without blocking; already-cached paths are noop
@@ -195,10 +203,19 @@ func (l *Loader) worker() {
 
 // run decodes e (whose state is already decoding) and publishes the result.
 func (l *Loader) run(e *entry) {
-	img, err := l.decode(e.path)
+	var (
+		img  *image.NRGBA
+		meta Meta
+		err  error
+	)
+	if l.decode != nil {
+		img, err = l.decode(e.path)
+	} else {
+		img, meta, err = decodeWithMeta(e.path)
+	}
 
 	l.mu.Lock()
-	e.img, e.err, e.state = img, err, finished
+	e.img, e.meta, e.err, e.state = img, meta, err, finished
 	if l.entries[e.path] == e { // not invalidated meanwhile
 		e.elem = l.lru.PushFront(e)
 		l.bytes += e.size()

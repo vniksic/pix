@@ -11,6 +11,9 @@ binary, no config file, meant to be launched from a terminal.
     pix a.png b.jpg c.webp  # view exactly these files
     pix a.jpg b.jpg somedir # these files, then somedir's images
     pix --all a.jpg somedir # same, with somedir's subdirectories too
+    find . -name '*.jpg' | pix -        # view the paths read from stdin
+    pix -sort date ~/DCIM   # in the order the pictures were taken
+    pix --all -out ../keep  # cull: mark keepers with m, they are copied to ../keep
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
 files never show up in the list. Formats: JPEG (with EXIF orientation), PNG,
@@ -32,6 +35,11 @@ GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
 | Ctrl+Shift+C                     | copy file path to clipboard              |
 | Tab, b                           | toggle the file list                     |
 | r                                | rescan the directory                     |
+| m                                | mark / unmark the image (★)              |
+| Enter                            | copy the marked images to the `-out` directory |
+| Delete                           | press twice (within 1.5 s) to move the file to the trash |
+| l                                | lock the view: zoom, position and rotation stay when changing image |
+| o                                | open the file in another program (`$PIX_OPEN`, else `xdg-open`) |
 | Escape                           | leave fullscreen, or quit                |
 | q                                | quit                                     |
 
@@ -49,13 +57,38 @@ The directory (or with `--all` the whole tree, up to 2000 directories) is
 watched, so files that appear or vanish show up without a restart. A list of
 paths is not watched; `r` re-checks it.
 
+The status bar shows the path, position, size, the date the picture was
+taken (when its EXIF has one), zoom and rotation, plus "lock" while the view
+is locked and how many images are marked.
+
+## Marking and culling
+
+`m` marks the current image (★ in the list and the status bar). With
+`-out DIR`, `Enter` copies the marked images there; files are never
+overwritten (an identical file already there is skipped, a different one
+with the same name gets `name-2.jpg`), and modification times are kept.
+When pix quits (q, Escape, or closing the window) any marked images not
+copied yet are copied too, then the marked paths are printed to stdout, one
+per line, in list order, so they can be piped:
+
+    pix --all -out ../keep              # copy the keepers
+    pix . | xargs -d '\n' -r gimp       # open the marked ones in GIMP
+    pix -sort date . > picks.txt        # just remember them
+
+Nothing else is ever written to stdout. `Delete`, pressed twice, moves the
+current file to the desktop trash (restorable from the file manager).
+
 ## Flags
 
-Flags go before the paths (`pix --all dir`, not `pix dir --all`).
+Flags go before the paths (`pix --all dir`, not `pix dir --all`). A single
+`-` as the path reads the list of paths from stdin, one per line.
 
     -all               include subdirectories, recursively (also --all)
-    -sort name|mtime   sort order (default name, natural order: img2 < img10;
-                       mtime sorts the whole tree by age with --all)
+    -sort name|mtime|date
+                       sort order (default name, natural order: img2 < img10;
+                       mtime and date sort the whole tree with --all; date is
+                       the EXIF date taken, files without one use mtime)
+    -out DIR           where Enter (and quitting) copies the marked images
     -fullscreen        start fullscreen
     -sidebar=false     start with the file list hidden
     -version

@@ -71,7 +71,8 @@ type viewport struct {
 	// Callbacks into the viewer.
 	onChange   func()               // view state changed (status bar)
 	onOne      func()               // double-click chose 1:1
-	onKey      func(*fyne.KeyEvent) // routed key presses
+	onKey      func(*fyne.KeyEvent) // routed key presses (repeats included)
+	onKeyDown  func(*fyne.KeyEvent) // routed physical key-downs (no repeats)
 	onRune     func(rune)           // routed characters
 	onShortcut func(fyne.Shortcut)  // routed shortcuts
 	onFocusOff func()               // focus lost
@@ -91,6 +92,7 @@ var (
 	_ fyne.DoubleTappable = (*viewport)(nil)
 	_ desktop.Mouseable   = (*viewport)(nil)
 	_ desktop.Cursorable  = (*viewport)(nil)
+	_ desktop.Keyable     = (*viewport)(nil)
 )
 
 func newViewport() *viewport {
@@ -176,7 +178,9 @@ func (v *viewport) SetMessage(msg string) {
 	v.img = nil
 	v.opaque = false
 	v.view.ImgW, v.view.ImgH = 0, 0
-	v.view.Rot = 0
+	if !v.view.Locked {
+		v.view.Rot = 0
+	}
 	v.msg.Text = msg
 	v.msg.Show()
 	v.msg.Refresh()
@@ -408,6 +412,15 @@ func (v *viewport) TypedKey(e *fyne.KeyEvent) {
 		v.onKey(e)
 	}
 }
+
+// KeyDown sees each physical press once; auto-repeat only reaches TypedKey.
+func (v *viewport) KeyDown(e *fyne.KeyEvent) {
+	if v.onKeyDown != nil {
+		v.onKeyDown(e)
+	}
+}
+
+func (v *viewport) KeyUp(*fyne.KeyEvent) {}
 
 func (v *viewport) TypedShortcut(s fyne.Shortcut) {
 	if v.onShortcut != nil {

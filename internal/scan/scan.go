@@ -3,8 +3,10 @@
 package scan
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +21,7 @@ type Entry struct {
 	Label   string // display path: relative to the listing root, or see Resolve
 	ModTime time.Time
 	Size    int64
+	Taken   time.Time // date taken (Options.Taken); filled only for SortDate, zero otherwise or when unknown
 }
 
 // Sort selects the playlist order.
@@ -27,12 +30,17 @@ type Sort int
 const (
 	SortName  Sort = iota // natural sort on Name, case-insensitive ("img2" < "img10")
 	SortMTime             // oldest first; ties broken by natural name
+	SortDate              // by date taken, oldest first; files without one use ModTime; ties as SortMTime
 )
 
 // Options configures Resolve.
 type Options struct {
 	Sort      Sort
 	Recursive bool // expand directories with ListTree instead of List
+	// Taken returns the date a file was taken (e.g. imgload.Taken) for
+	// SortDate. It may be called concurrently. nil makes SortDate order
+	// like SortMTime.
+	Taken func(path string) (time.Time, bool)
 }
 
 // Resolve turns CLI args into a playlist.
@@ -51,14 +59,25 @@ type Options struct {
 // drop duplicates, and label each file relative to the working directory
 // when it is under it, else by its absolute path with $HOME shortened to
 // "~". Returns an error only when nothing is viewable.
+//
+// The single argument "-" reads the list of paths from standard input
+// (see ResolveReader).
+//
+// Resolve also remembers opts.Taken (nil clears it): List and ListTree use
+// it for SortDate, so rescans keep the same order. Dates are cached by
+// path, size and modification time.
 func Resolve(args []string, opts Options) (entries []Entry, start int, roots []string, err error) {
+	if len(args) == 1 && args[0] == "-" {
+		return ResolveReader(os.Stdin, opts)
+	}
+	c := setTakenSource(opts.Taken)
 	switch len(args) {
 	case 0:
 		cwd, err := os.Getwd()
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		return resolveDir(cwd, opts)
+		return resolveDir(cwd, opts, c)
 	case 1:
 		abs, err := filepath.Abs(args[0])
 		if err != nil {
@@ -69,11 +88,39 @@ func Resolve(args []string, opts Options) (entries []Entry, start int, roots []s
 			return nil, 0, nil, err
 		}
 		if fi.IsDir() {
-			return resolveDir(abs, opts)
+			return resolveDir(abs, opts, c)
 		}
-		return resolveFile(abs, fi, opts)
+		return resolveFile(abs, fi, opts, c)
 	}
+	return resolveAdhoc(args, opts, c)
+}
 
+// ResolveReader builds an ad-hoc list (as Resolve does for several
+// arguments) from newline-separated paths read from r: CRLF line endings
+// are tolerated, blank lines skipped, relative paths taken against the
+// working directory, directories expanded and missing paths skipped. Even
+// a single path makes an ad-hoc list. roots is always nil. It is what
+// Resolve uses for the argument "-".
+func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots []string, err error) {
+	c := setTakenSource(opts.Taken)
+	var paths []string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSuffix(sc.Text(), "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		paths = append(paths, line)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, nil, fmt.Errorf("reading path list: %w", err)
+	}
+	return resolveAdhoc(paths, opts, c)
+}
+
+// resolveAdhoc implements the ad-hoc list case of Resolve.
+func resolveAdhoc(args []string, opts Options, c *takenCache) (entries []Entry, start int, roots []string, err error) {
 	cwd, _ := os.Getwd()
 	home, _ := os.UserHomeDir()
 	seen := make(map[string]bool)
@@ -94,7 +141,7 @@ func Resolve(args []string, opts Options) (entries []Entry, start int, roots []s
 			continue
 		}
 		if fi.IsDir() {
-			list, err := listDir(abs, opts)
+			list, err := listDir(abs, opts, c)
 			if err != nil {
 				continue
 			}
@@ -108,18 +155,21 @@ func Resolve(args []string, opts Options) (entries []Entry, start int, roots []s
 	if len(entries) == 0 {
 		return nil, 0, nil, errors.New("no viewable images among the given paths")
 	}
+	if opts.Sort == SortDate {
+		c.fill(entries) // the files given directly; listed ones are cached
+	}
 	return entries, 0, nil, nil
 }
 
-func listDir(dir string, opts Options) ([]Entry, error) {
+func listDir(dir string, opts Options, c *takenCache) ([]Entry, error) {
 	if opts.Recursive {
-		return ListTree(dir, opts.Sort)
+		return listTree(dir, opts.Sort, c)
 	}
-	return List(dir, opts.Sort)
+	return list(dir, opts.Sort, c)
 }
 
-func resolveDir(dir string, opts Options) ([]Entry, int, []string, error) {
-	entries, err := listDir(dir, opts)
+func resolveDir(dir string, opts Options, c *takenCache) ([]Entry, int, []string, error) {
+	entries, err := listDir(dir, opts, c)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -132,11 +182,16 @@ func resolveDir(dir string, opts Options) ([]Entry, int, []string, error) {
 	return entries, 0, []string{dir}, nil
 }
 
-func resolveFile(path string, fi os.FileInfo, opts Options) ([]Entry, int, []string, error) {
+func resolveFile(path string, fi os.FileInfo, opts Options, c *takenCache) ([]Entry, int, []string, error) {
 	dir := filepath.Dir(path)
 	roots := []string{dir}
 	self := entryOf(path, filepath.Base(path), fi)
-	entries, err := listDir(dir, opts)
+	if opts.Sort == SortDate {
+		one := []Entry{self}
+		c.fill(one)
+		self = one[0]
+	}
+	entries, err := listDir(dir, opts, c)
 	if err != nil {
 		// Unreadable parent: still show the one file we were given.
 		return []Entry{self}, 0, roots, nil
@@ -155,8 +210,13 @@ func indexOf(entries []Entry, path string) int {
 
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed. Each
-// Label is the file's Name.
+// Label is the file's Name. SortDate uses the Taken function of the last
+// Resolve (see there).
 func List(dir string, sort Sort) ([]Entry, error) {
+	return list(dir, sort, takenSource.Load())
+}
+
+func list(dir string, sort Sort, c *takenCache) ([]Entry, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -171,6 +231,9 @@ func List(dir string, sort Sort) ([]Entry, error) {
 			entries = append(entries, e)
 		}
 	}
+	if sort == SortDate {
+		c.fill(entries)
+	}
 	sortEntries(entries, sort)
 	return entries, nil
 }
@@ -184,8 +247,13 @@ func List(dir string, sort Sort) ([]Entry, error) {
 // SortName lists each directory's own images first, in natural order, then
 // its subdirectories in natural order, each the same way, so a directory's
 // pictures stay together. SortMTime is one flat oldest-first order over the
-// whole tree, ties broken by path.
+// whole tree, ties broken by path; so is SortDate, by date taken (Taken of
+// the last Resolve) falling back to ModTime.
 func ListTree(root string, sort Sort) ([]Entry, error) {
+	return listTree(root, sort, takenSource.Load())
+}
+
+func listTree(root string, sort Sort, c *takenCache) ([]Entry, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -215,6 +283,9 @@ func ListTree(root string, sort Sort) ([]Entry, error) {
 		}
 	}
 	walk(root, "", des)
+	if sort == SortDate {
+		c.fill(entries)
+	}
 	sortEntries(entries, sort)
 	return entries, nil
 }
@@ -280,12 +351,18 @@ func under(root, path string) (string, bool) {
 }
 
 // Compare orders entries the way List and ListTree sort them: by
-// modification time first for SortMTime, then in tree order on Label (a
+// modification time first for SortMTime, by date taken (Taken, or ModTime
+// when Taken is zero) first for SortDate, then in tree order on Label (a
 // directory's own files before its subdirectories, both in natural order),
 // then by Path.
 func Compare(a, b Entry, sort Sort) int {
-	if sort == SortMTime {
+	switch sort {
+	case SortMTime:
 		if c := a.ModTime.Compare(b.ModTime); c != 0 {
+			return c
+		}
+	case SortDate:
+		if c := dateKey(a).Compare(dateKey(b)); c != 0 {
 			return c
 		}
 	}

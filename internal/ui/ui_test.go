@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,5 +144,51 @@ func TestSplitLabel(t *testing.T) {
 	labels = append(labels, "sub/c.jpg")
 	if !hasDirParts(len(labels), at) {
 		t.Error("hasDirParts: false with a directory part")
+	}
+}
+
+// finish (the exit path after the event loop) copies what is marked and not
+// yet copied, then prints the marked paths in playlist order.
+func TestFinishCopiesAndPrintsMarked(t *testing.T) {
+	src, out := t.TempDir(), filepath.Join(t.TempDir(), "keep")
+	var paths []string
+	for _, n := range []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg"} {
+		p := filepath.Join(src, n)
+		if err := os.WriteFile(p, []byte("data "+n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	var stdout strings.Builder
+	u := &viewer{
+		opts:   Options{OutDir: out, Stdout: &stdout},
+		marks:  map[string]bool{paths[3]: true, paths[0]: true, paths[2]: true, "/gone.jpg": true},
+		copied: map[string]bool{paths[2]: true}, // copied earlier with Enter
+		final:  paths,
+		errOut: io.Discard,
+	}
+	if err := u.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if want := paths[0] + "\n" + paths[2] + "\n" + paths[3] + "\n"; stdout.String() != want {
+		t.Errorf("stdout %q, want %q", stdout.String(), want)
+	}
+	ents, err := os.ReadDir(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	if !slices.Equal(names, []string{"a.jpg", "d.jpg"}) {
+		t.Errorf("copied %v, want [a.jpg d.jpg] (c.jpg was already copied)", names)
+	}
+
+	// Nothing marked: nothing printed, nothing copied, no -out needed.
+	stdout.Reset()
+	u = &viewer{opts: Options{Stdout: &stdout}, marks: map[string]bool{}, copied: map[string]bool{}, final: paths}
+	if err := u.finish(); err != nil || stdout.Len() != 0 {
+		t.Errorf("unmarked: err %v, stdout %q", err, stdout.String())
 	}
 }

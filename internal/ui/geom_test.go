@@ -533,3 +533,64 @@ func TestViewFitNeverUpscalesRotated(t *testing.T) {
 		t.Errorf("1x1: scale %v", v.Scale)
 	}
 }
+
+func TestViewLockedKeepsOneAndPan(t *testing.T) {
+	v := newView(1000, 800, 4000, 3000)
+	v.SetOne()
+	v.Pan(-300, -300) // (-1800, -1400)
+	v.Locked = true
+
+	v.SetImage(4000, 3000) // same size: nothing moves
+	if v.Mode != ModeOne || v.Scale != 1 || v.OX != -1800 || v.OY != -1400 {
+		t.Errorf("same size: mode %v scale %v off (%v,%v)", v.Mode, v.Scale, v.OX, v.OY)
+	}
+	v.SetImage(2000, 1000) // smaller: offsets clamped so the image still covers
+	if v.Mode != ModeOne || v.Scale != 1 || v.OX != -1000 || v.OY != -200 {
+		t.Errorf("smaller: mode %v scale %v off (%v,%v), want (-1000,-200)", v.Mode, v.Scale, v.OX, v.OY)
+	}
+	v.SetImage(500, 400) // smaller than the viewport: centred
+	if v.Mode != ModeOne || v.Scale != 1 || v.OX != 250 || v.OY != 200 {
+		t.Errorf("tiny: mode %v scale %v off (%v,%v), want (250,200)", v.Mode, v.Scale, v.OX, v.OY)
+	}
+}
+
+func TestViewLockedKeepsFreeZoomAndRotation(t *testing.T) {
+	v := newView(1000, 800, 4000, 3000)
+	v.Rotate(1)           // portrait 3000x4000, fit 0.2
+	v.ZoomBy(2, 500, 400) // free at 0.4: 1200x1600
+	v.Pan(-50, -50)
+	if v.Mode != ModeFree || !near(v.Scale, 0.4) {
+		t.Fatalf("setup: mode %v scale %v", v.Mode, v.Scale)
+	}
+	scale, ox, oy := v.Scale, v.OX, v.OY
+	v.Locked = true
+	v.SetImage(4000, 3000)
+	if v.Mode != ModeFree || v.Rot != 1 || v.Scale != scale || v.OX != ox || v.OY != oy {
+		t.Errorf("locked free: mode %v rot %v scale %v off (%v,%v); want rot 1 scale %v off (%v,%v)",
+			v.Mode, v.Rot, v.Scale, v.OX, v.OY, scale, ox, oy)
+	}
+
+	v.Locked = false
+	v.SetImage(4000, 3000)
+	if v.Mode != ModeFit || v.Rot != 0 || !near(v.Scale, 0.25) {
+		t.Errorf("unlocked: mode %v rot %v scale %v", v.Mode, v.Rot, v.Scale)
+	}
+}
+
+func TestViewLockedFitKeepsRotation(t *testing.T) {
+	v := newView(1000, 800, 4000, 2000)
+	v.Rotate(1)
+	v.Locked = true
+	v.SetImage(2000, 4000) // rotated: 4000x2000, fit 0.25
+	if v.Mode != ModeFit || v.Rot != 1 || !near(v.Scale, 0.25) || !near(v.OX, 0) || !near(v.OY, 150) {
+		t.Errorf("locked fit: mode %v rot %v scale %v off (%v,%v)", v.Mode, v.Rot, v.Scale, v.OX, v.OY)
+	}
+
+	// A locked view that never showed anything starts in fit.
+	w := &View{Locked: true}
+	w.SetViewport(1000, 800)
+	w.SetImage(4000, 2000)
+	if w.Mode != ModeFit || !near(w.Scale, 0.25) || !near(w.OY, 150) {
+		t.Errorf("first image: mode %v scale %v off (%v,%v)", w.Mode, w.Scale, w.OX, w.OY)
+	}
+}

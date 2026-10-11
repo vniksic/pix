@@ -3,9 +3,11 @@
 package ui
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"image/color"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"pix/internal/clipboard"
+	"pix/internal/fileops"
 	"pix/internal/hypr"
 	"pix/internal/imgload"
 	"pix/internal/scan"
@@ -39,11 +42,14 @@ type Options struct {
 	Fullscreen bool // start fullscreen
 	Sidebar    bool // sidebar visible at start
 	Loader     *imgload.Loader
+	OutDir     string    // -out: where Enter and quitting copy marked files ("" = nowhere)
+	Stdout     io.Writer // receives the marked paths when Run ends (default os.Stdout)
 }
 
 const (
-	loadingDelay = 150 * time.Millisecond // keep the old image this long before showing "loading…"
-	flashTime    = 2 * time.Second        // how long transient status messages stay
+	loadingDelay = 150 * time.Millisecond  // keep the old image this long before showing "loading…"
+	flashTime    = 2 * time.Second         // how long transient status messages stay
+	deleteWindow = 1500 * time.Millisecond // a second Delete within this trashes the file
 
 	hyprRetries    = 5                      // Hyprland fullscreen retries while our window is not mapped yet
 	hyprRetryDelay = 100 * time.Millisecond // pause between those retries
@@ -78,6 +84,7 @@ type viewer struct {
 	loading    bool
 	loadSlow   bool // loading has taken longer than loadingDelay
 	loadErr    error
+	taken      time.Time // when the shown picture was taken (zero if unknown)
 	flash      string
 	flashToken uint64
 	stopWatch  func()
@@ -99,6 +106,28 @@ type viewer struct {
 	copyMu      sync.Mutex
 	copyPending *copyJob
 	copyBusy    bool
+
+	// Marks. markMu guards marks and copied: the copy-out and trash
+	// goroutines update them, and Run reads them after the event loop.
+	markMu  sync.Mutex
+	marks   map[string]bool // marked paths
+	copied  map[string]bool // marked paths already copied to OutDir
+	nMarked int             // marked entries in the playlist
+	outBusy bool            // a copy to OutDir is running
+	// bg counts copy-out and trash goroutines; Run waits for them.
+	bg sync.WaitGroup
+	// final is the playlist (paths, in order) when the window closed, for
+	// the exit copy and the list printed to stdout.
+	final []string
+	// errOut receives the exit copy summary (nil: os.Stderr).
+	errOut io.Writer
+
+	// Pending Delete: a second press on the same file within deleteWindow
+	// trashes it. trashing holds paths being trashed.
+	delPath   string
+	delAt     time.Time
+	delPrompt string
+	trashing  map[string]bool
 
 	reqMu      sync.Mutex // guards reqPending and reqBusy (shared with the load goroutine)
 	reqPending *loadReq
@@ -129,6 +158,9 @@ func Run(opts Options) error {
 		loader:    opts.Loader,
 		entries:   opts.Entries,
 		sidebarOn: opts.Sidebar,
+		marks:     make(map[string]bool),
+		copied:    make(map[string]bool),
+		trashing:  make(map[string]bool),
 	}
 	if opts.Dir != "" && opts.Start >= 0 && opts.Start < len(opts.Entries) {
 		u.pinned = opts.Entries[opts.Start].Path
@@ -170,7 +202,15 @@ func Run(opts Options) error {
 		}
 	}
 	u.win.SetOnClosed(func() {
+		// Every way out (q, Escape, closing the window) comes here, on the
+		// main goroutine, while the loop still runs. From now on callbacks
+		// leave the viewer state alone (they check quitting), so Run can
+		// read it once the loop is over.
 		u.quitting = true
+		u.final = make([]string, len(u.entries))
+		for i, e := range u.entries {
+			u.final[i] = e.Path
+		}
 		if u.stopWatch != nil {
 			u.stopWatch()
 		}
@@ -178,7 +218,53 @@ func Run(opts Options) error {
 
 	u.win.ShowAndRun()
 	u.copies.Wait()
-	return nil
+	u.bg.Wait()
+	return u.finish()
+}
+
+// finish runs after the event loop: it copies marked files not yet copied
+// to OutDir (if set; one summary line on stderr), then prints every marked
+// path, in playlist order, to Stdout. Nothing else in pix writes there, so
+// the output can be piped. A failed copy is returned as the error.
+func (u *viewer) finish() error {
+	u.markMu.Lock()
+	var marked, pending []string
+	for _, p := range u.final {
+		if u.marks[p] {
+			marked = append(marked, p)
+			if !u.copied[p] {
+				pending = append(pending, p)
+			}
+		}
+	}
+	u.markMu.Unlock()
+
+	var err error
+	if dir := u.opts.OutDir; dir != "" && len(pending) > 0 {
+		msg, failed := copySummary(fileops.CopyAll(pending, dir), dir)
+		if failed {
+			err = errors.New(msg)
+		} else {
+			errOut := u.errOut
+			if errOut == nil {
+				errOut = os.Stderr
+			}
+			fmt.Fprintln(errOut, "pix: "+msg)
+		}
+	}
+
+	out := u.opts.Stdout
+	if out == nil {
+		out = os.Stdout
+	}
+	w := bufio.NewWriter(out)
+	for _, p := range marked {
+		fmt.Fprintln(w, p)
+	}
+	if ferr := w.Flush(); ferr != nil && err == nil {
+		err = fmt.Errorf("printing marked files: %w", ferr)
+	}
+	return err
 }
 
 func (u *viewer) build() {
@@ -186,6 +272,7 @@ func (u *viewer) build() {
 	u.vp.onChange = u.viewChanged
 	u.vp.onOne = u.explicitOne
 	u.vp.onKey = u.typedKey
+	u.vp.onKeyDown = u.keyDown
 	u.vp.onRune = u.typedRune
 	u.vp.onShortcut = u.typedShortcut
 	u.vp.focusSelf = u.focusViewport
@@ -209,8 +296,9 @@ func (u *viewer) build() {
 	// listing (new subdirectories may appear), else only if the fixed
 	// ad-hoc list has some.
 	twoLine := (u.opts.Dir != "" && u.opts.Recursive) || hasDirParts(len(u.entries), label)
-	u.list = newSideList(func() int { return len(u.entries) }, label, twoLine)
+	u.list = newSideList(func() int { return len(u.entries) }, label, u.isMarkedAt, twoLine)
 	u.list.onKey = u.typedKey
+	u.list.onKeyDown = u.keyDown
 	u.list.onRune = u.typedRune
 	u.list.onShortcut = u.typedShortcut
 	u.list.OnSelected = func(id int) {
@@ -235,6 +323,9 @@ func (u *viewer) build() {
 	// Canvas-level fallbacks for when nothing is focused.
 	c.SetOnTypedKey(func(e *fyne.KeyEvent) { u.typedKey(e); u.focusViewport() })
 	c.SetOnTypedRune(func(r rune) { u.typedRune(r); u.focusViewport() })
+	if dc, ok := c.(desktop.Canvas); ok {
+		dc.SetOnKeyDown(u.keyDown)
+	}
 	// Ctrl+C arrives as fyne.ShortcutCopy from the GLFW driver; register the
 	// desktop.CustomShortcut form too in case another driver reports that.
 	c.AddShortcut(&fyne.ShortcutCopy{}, u.typedShortcut)
@@ -323,7 +414,7 @@ func (u *viewer) loadLoop() {
 		u.reqMu.Unlock()
 
 		e := r.entry
-		img, err := u.loader.Get(e.Path)
+		img, meta, err := u.loader.GetMeta(e.Path)
 		if err == nil && img == nil {
 			err = errors.New("no image")
 		}
@@ -343,8 +434,10 @@ func (u *viewer) loadLoop() {
 			u.loading, u.loadSlow = false, false
 			if err != nil {
 				u.loadErr = err
+				u.taken = time.Time{}
 				u.vp.SetMessage("cannot show " + e.Label + ": " + err.Error())
 			} else {
+				u.taken = meta.Taken
 				u.vp.SetImage(img, opaque)
 			}
 			u.updateStatus()
@@ -456,17 +549,12 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 		newIdx = max(0, min(u.idx, len(entries)-1))
 	}
 	u.entries = entries
+	u.recountMarks()
 	u.list.UnselectAll()
 	u.list.Refresh()
 
 	if len(entries) == 0 {
-		u.idx = 0
-		u.loadToken++
-		u.loading, u.loadSlow = false, false
-		u.loadErr = nil
-		u.win.SetTitle("pix")
-		u.vp.SetMessage("no images")
-		u.updateStatus()
+		u.showNone()
 		return
 	}
 	if reload {
@@ -475,6 +563,17 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 	}
 	u.idx = newIdx
 	u.syncList()
+	u.updateStatus()
+}
+
+// showNone is the empty-playlist state.
+func (u *viewer) showNone() {
+	u.idx = 0
+	u.loadToken++
+	u.loading, u.loadSlow = false, false
+	u.loadErr = nil
+	u.win.SetTitle("pix")
+	u.vp.SetMessage("no images")
 	u.updateStatus()
 }
 
@@ -495,6 +594,9 @@ func withPinned(entries []scan.Entry, path, root string, sort scan.Sort) []scan.
 		Label:   scan.RelLabel(root, path),
 		ModTime: fi.ModTime(),
 		Size:    fi.Size(),
+	}
+	if sort == scan.SortDate {
+		p.Taken, _ = imgload.Taken(path)
 	}
 	i := slices.IndexFunc(entries, func(e scan.Entry) bool { return scan.Compare(p, e, sort) < 0 })
 	if i < 0 {
@@ -542,40 +644,25 @@ func (u *viewer) applyStatusBar() {
 }
 
 func (u *viewer) updateStatus() {
-	if len(u.entries) == 0 {
-		u.setStatus(joinNonEmpty("no images", u.flash))
-		return
+	s := statusInfo{
+		Empty:   len(u.entries) == 0,
+		Locked:  u.vp.view.Locked,
+		NMarked: u.nMarked,
+		Flash:   u.flash,
 	}
-	e := u.entries[u.idx]
-	parts := []string{e.Label, fmt.Sprintf("%d/%d", u.idx+1, len(u.entries))}
-	switch {
-	case u.loading:
-		if u.loadSlow {
-			parts = append(parts, "loading…")
-		}
-	case u.loadErr != nil:
-		parts = append(parts, "error: "+u.loadErr.Error())
-	case u.vp.img != nil:
-		b := u.vp.img.Bounds()
-		parts = append(parts, fmt.Sprintf("%d×%d", b.Dx(), b.Dy()), fmt.Sprintf("%d%%", u.vp.view.Percent()))
-		if r := u.vp.view.Rot; r != 0 {
-			parts = append(parts, fmt.Sprintf("↻%d°", r*90))
+	if !s.Empty {
+		e := u.entries[u.idx]
+		s.Label, s.Index, s.Count = e.Label, u.idx, len(u.entries)
+		s.Marked = u.isMarked(e.Path)
+		s.Loading, s.Slow, s.Err = u.loading, u.loadSlow, u.loadErr
+		if img := u.vp.img; img != nil {
+			b := img.Bounds()
+			s.HasImg, s.W, s.H = true, b.Dx(), b.Dy()
+			s.Taken = u.taken
+			s.Percent, s.Rot = u.vp.view.Percent(), u.vp.view.Rot
 		}
 	}
-	if u.flash != "" {
-		parts = append(parts, u.flash)
-	}
-	u.setStatus(strings.Join(parts, "   "))
-}
-
-func joinNonEmpty(parts ...string) string {
-	var out []string
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return strings.Join(out, "   ")
+	u.setStatus(statusText(s))
 }
 
 func (u *viewer) setStatus(s string) {
@@ -585,12 +672,15 @@ func (u *viewer) setStatus(s string) {
 }
 
 // flashMsg shows a transient message in the status bar.
-func (u *viewer) flashMsg(msg string) {
-	u.flash = msg
+func (u *viewer) flashMsg(msg string) { u.flashFor(msg, flashTime) }
+
+// flashFor shows a transient message for d.
+func (u *viewer) flashFor(msg string, d time.Duration) {
+	u.flash = strings.ReplaceAll(msg, "\n", "; ") // joined errors: keep one line
 	u.flashToken++
 	tok := u.flashToken
 	u.updateStatus()
-	time.AfterFunc(flashTime, func() {
+	time.AfterFunc(d, func() {
 		fyne.Do(func() {
 			if tok == u.flashToken {
 				u.flash = ""
@@ -703,6 +793,9 @@ func (u *viewer) quit() {
 // ---- keys ----
 
 func (u *viewer) typedKey(e *fyne.KeyEvent) {
+	if e.Name != fyne.KeyDelete && !isModifierKey(e.Name) {
+		u.cancelDelete()
+	}
 	switch e.Name {
 	case fyne.KeyPageDown, fyne.KeySpace, fyne.KeyRight:
 		u.step(1)
@@ -714,6 +807,8 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 		u.show(len(u.entries) - 1)
 	case fyne.KeyTab:
 		u.toggleSidebar()
+	case fyne.KeyReturn, fyne.KeyEnter:
+		u.copyMarked()
 	case fyne.KeyEscape:
 		if u.fullscreen {
 			u.setFullscreen(false)
@@ -724,6 +819,7 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 }
 
 func (u *viewer) typedRune(r rune) {
+	u.cancelDelete()
 	v := &u.vp.view
 	switch unicode.ToLower(r) {
 	case 'n':
@@ -755,12 +851,20 @@ func (u *viewer) typedRune(r rune) {
 		u.toggleSidebar()
 	case 'r':
 		u.rescan()
+	case 'm':
+		u.toggleMark()
+	case 'l':
+		v.Locked = !v.Locked
+		u.updateStatus()
+	case 'o':
+		u.openExternal()
 	case 'q':
 		u.quit()
 	}
 }
 
 func (u *viewer) typedShortcut(s fyne.Shortcut) {
+	u.cancelDelete()
 	switch s.ShortcutName() {
 	case (&fyne.ShortcutCopy{}).ShortcutName(), shortcutCtrlC.ShortcutName():
 		u.copyImage()

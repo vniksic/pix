@@ -230,6 +230,9 @@ type View struct {
 	Scale      float64
 	OX, OY     float64 // top-left of the rotated, scaled image in the viewport
 	VW, VH     float64 // viewport size in device pixels
+	// Locked keeps the mode, scale, pan offsets and rotation across image
+	// changes (offsets clamped for the new size) instead of resetting them.
+	Locked bool
 }
 
 // HasImage reports whether there is a non-empty image to show.
@@ -279,9 +282,19 @@ func (v *View) SetViewport(w, h float64) {
 }
 
 // SetImage switches to a new w×h image. Rotation resets to 0. Fit stays fit,
-// 1:1 stays 1:1 (recentred), free zoom resets to fit.
+// 1:1 stays 1:1 (recentred), free zoom resets to fit. When Locked, the
+// mode, scale, rotation and pan offsets are kept instead (Fit re-fits; the
+// offsets are clamped for the new size).
 func (v *View) SetImage(w, h float64) {
 	v.ImgW, v.ImgH = w, h
+	if v.Locked && v.Scale > 0 {
+		if v.Mode == ModeFit {
+			v.applyFit()
+		} else {
+			v.clamp()
+		}
+		return
+	}
 	v.Rot = 0
 	switch v.Mode {
 	case ModeOne:

@@ -10,7 +10,8 @@ Module name: `pix`. Binary: `pix`. Go 1.26 (go.mod already set up, deps fetched)
 
     main.go                 flags, wiring, exit codes
     internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, dir watch
-    internal/imgload/       decoding (all formats), EXIF orientation, async LRU cache
+    internal/imgload/       decoding (all formats), EXIF orientation and date taken, async LRU cache
+    internal/fileops/       copying marked files out, freedesktop trash, opening in another program
     internal/clipboard/     image/text copy via wl-copy (Wayland) or xclip (X11)
     internal/hypr/          Hyprland control-socket client (fullscreen on the current monitor)
     internal/ui/            Fyne app: window, viewport widget, sidebar, status bar, keys
@@ -32,17 +33,21 @@ type Entry struct {
     Label   string      // display path (see Resolve)
     ModTime time.Time
     Size    int64
+    Taken   time.Time   // date taken; filled when Sort == SortDate (zero otherwise or unknown)
 }
 
 type Sort int
 const (
     SortName  Sort = iota // natural sort on Name, case-insensitive ("img2" < "img10")
     SortMTime             // oldest first; ties broken by natural name
+    SortDate              // by date taken (Options.Taken), files without one fall back
+                          // to ModTime; ties by path. Flat across the tree like SortMTime.
 )
 
 type Options struct {
     Sort      Sort
     Recursive bool // expand directories with ListTree instead of List (-all)
+    Taken     func(path string) (time.Time, bool) // for SortDate; nil -> SortDate behaves like SortMTime
 }
 
 // Resolve turns CLI args into a playlist.
@@ -59,8 +64,17 @@ type Options struct {
 // path relative to the cwd when the file is under it, else the absolute
 // path with $HOME shortened to "~". Ad-hoc lists keep argument order (each
 // expanded dir sorted internally) and drop duplicates.
+// args == []string{"-"} reads newline-separated paths from os.Stdin (CRLF
+// tolerated, blank lines skipped, relative paths against the cwd,
+// directories expanded like other ad-hoc args, missing paths skipped),
+// labelled as an ad-hoc list.
+// Resolve remembers opts.Taken so later List/ListTree rescans keep the
+// SortDate order.
 // Returns an error only when nothing is viewable.
 func Resolve(args []string, opts Options) (entries []Entry, start int, roots []string, err error)
+
+// ResolveReader is what "-" uses (paths read from r); for tests.
+func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots []string, err error)
 
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed.
@@ -126,6 +140,22 @@ func NewLoader(capacity, workers int) *Loader
 // file does not re-decode on every visit) but evicted like images.
 func (l *Loader) Get(path string) (*image.NRGBA, error)
 
+// GetMeta is Get that also returns the file's Meta, cached with the image.
+func (l *Loader) GetMeta(path string) (*image.NRGBA, Meta, error)
+
+// Meta is what pix reads from a file besides its pixels.
+type Meta struct {
+    Taken time.Time // EXIF DateTimeOriginal (fallback: DateTime); zero when absent
+}
+
+// ReadMeta parses only the EXIF block (JPEG APP1, TIFF, WebP EXIF chunk,
+// HEIC/AVIF where trivially available); never decodes pixels. Errors give
+// a zero Meta.
+func ReadMeta(path string) Meta
+
+// Taken is ReadMeta(path).Taken and whether it is set (scan.Options.Taken).
+func Taken(path string) (time.Time, bool)
+
 // Prefetch schedules decodes without blocking; already-cached paths are noop.
 func (l *Loader) Prefetch(paths ...string)
 
@@ -136,6 +166,36 @@ func (l *Loader) Invalidate(path string)
 // DefaultByteBudget = 1.5 GiB) on top of the count cap. LRU entries beyond
 // either cap are evicted; the image last asked for by Get is always kept.
 func (l *Loader) SetByteBudget(n int64)
+```
+
+### internal/fileops
+
+```go
+package fileops
+
+type CopyResult struct {
+    Src, Dst string
+    Skipped  bool  // an identical file was already there (Dst names it)
+    Err      error
+}
+
+// CopyAll copies each src into dir (created 0755 if missing), never
+// overwriting: the destination is the base name; if that exists and is
+// byte-identical (size, then content) the copy is Skipped, else name-2.ext,
+// name-3.ext ... is tried until free. Two srcs with the same base name in
+// one call get distinct names. Copies keep the mtime; a partial copy is
+// removed on error. Results are in the order of srcs.
+func CopyAll(srcs []string, dir string) []CopyResult
+
+// Trash moves path to the freedesktop trash: the home trash
+// ($XDG_DATA_HOME/Trash or ~/.local/share/Trash, files/ + info/*.trashinfo)
+// or, on another filesystem, $topdir/.Trash/$uid or $topdir/.Trash-$uid.
+// The file is never removed unless the move succeeded. Pure Go, no gio.
+func Trash(path string) error
+
+// OpenExternal starts $PIX_OPEN (a program name, argument = path) or
+// xdg-open with the path, detached (Setsid), stdio on /dev/null.
+func OpenExternal(path string) error
 ```
 
 ### internal/clipboard
@@ -173,9 +233,13 @@ type Options struct {
     Fullscreen bool           // start fullscreen
     Sidebar    bool           // sidebar visible at start
     Loader     *imgload.Loader
+    OutDir     string         // -out: copy destination for marked files ("" = none)
+    Stdout     io.Writer      // receives the marked paths at exit (default os.Stdout)
 }
 
-// Run builds the Fyne app and blocks until the window closes.
+// Run builds the Fyne app and blocks until the window closes, then copies
+// marked files not yet copied to OutDir and prints the marked paths to
+// Stdout (see "Marks"). A failed exit copy is returned as the error.
 func Run(opts Options) error
 ```
 
@@ -222,6 +286,11 @@ Cursor turns to a grab hand while dragging if Fyne supports it (desktop.Cursorab
 Changing image: keep the current mode (fit stays fit; 1:1 stays 1:1 recentred;
 free zoom resets to fit). Rotation resets to 0 on image change.
 
+View lock (`l`, View.Locked): while locked, changing image keeps the mode,
+scale, rotation and pan offsets instead (offsets clamped for the new image
+size; Fit re-fits with the kept rotation), so a series of shots can be
+compared at the same spot. "loading"/error messages keep the rotation too.
+
 ### Keys (global, via Canvas().SetOnTypedKey / SetOnTypedRune / AddShortcut)
 
     PageDown, Space, Right, n     next image
@@ -236,6 +305,11 @@ free zoom resets to fit). Rotation resets to 0 on image change.
     Ctrl+Shift+C                  copy absolute path as text
     Tab, b                        toggle sidebar (both; Fyne may eat Tab for focus)
     r                             rescan directory now
+    m                             mark / unmark the current image
+    Enter                         copy marked files not yet copied to -out (in a goroutine)
+    Delete                        first press asks; a second press within 1.5s moves the file to the trash
+    l                             lock / unlock the view across image changes
+    o                             open the file in another program ($PIX_OPEN or xdg-open)
     Escape                        leave fullscreen if in it, else quit
     q                             quit
 
@@ -290,14 +364,51 @@ both lines; an item without a directory part hides the second line and
 centres the name. Two-line items are used in recursive single-root mode
 (new subdirectories may appear) and for ad-hoc lists where some Label has
 a directory part; otherwise (plain directory listing) items are one line.
-Long text is truncated with an ellipsis.
+Long text is truncated with an ellipsis. A marked entry's name starts with
+"★ " (same row height either way).
 
 ### Status bar
 
-One line, small text, left aligned:
-`sub/name.jpg   12/87   4000×3000   33%   ↻90°` (the Label; rotation part only when ≠0).
-Show `error: <msg>` in place of dims if decode failed (the viewport shows a
-plain message too; paging must still work past broken files).
+One line, small text, left aligned, parts three spaces apart:
+
+    sub/name.jpg ★   12/87   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <message>
+
+The Label, "★" when the image is marked, position, dimensions, date taken
+(EXIF, "2006-01-02 15:04", only when present), zoom, rotation (only when
+≠0), "lock" while the view is locked, "N marked" when N > 0, and a transient
+message (2s). Show `error: <msg>` in place of dims if decode failed (the
+viewport shows a plain message too; paging must still work past broken
+files). It is composed by the pure function statusText (tested headless).
+
+### Marks, copying out, trash
+
+- `m` toggles a mark on the current file (a set keyed by path; marks of
+  files that leave the listing are kept and count again if they return).
+- `Enter` copies the marked files not copied yet to `-out` with
+  fileops.CopyAll, in playlist order, off the main goroutine (one copy at a
+  time), then flashes `copied 3 to DIR`, `copied 2, skipped 1 (already
+  there)`, or the first error. Without `-out`: `no -out directory`.
+- Quitting (q, Escape, closing the window): the window's OnClosed handler
+  (main goroutine, every quit path) snapshots the playlist order and sets
+  `quitting`, after which callbacks leave the state alone. Once
+  ShowAndRun returns, Run waits for clipboard, copy-out and trash
+  goroutines, then, if `-out` is set, synchronously copies the marked files
+  not yet copied (one summary line on stderr; a failure exits 1), and
+  finally prints every marked path, absolute, one per line, in playlist
+  order, to stdout.
+- Nothing else writes to stdout: main moves the real stdout to a
+  close-on-exec descriptor for that list and points fd 1 at stderr, so
+  Fyne, GL drivers, C decoders and child processes cannot pollute a pipe.
+- `Delete` (KeyDown, so auto-repeat never counts as a second press) flashes
+  `Delete again to trash <name>`; a second press on the same file within
+  1.5s runs fileops.Trash in a goroutine. On success the entry leaves the
+  playlist and the marks, its decode is invalidated, the next image is
+  shown (the previous if it was the last; "no images" if none) and
+  `trashed <name>` flashes. On error the error is flashed and the entry
+  stays. Any other key (modifiers alone excepted) cancels the pending
+  Delete.
+- `o` runs fileops.OpenExternal on the current file in a goroutine and
+  flashes an error, if any.
 
 ### Directory watching
 
@@ -316,16 +427,20 @@ After showing index i, Prefetch(i+1, i-1, i+2). Loader cap 6.
 ## main.go flags
 
     pix [flags] [path ...]
+    pix [flags] -        paths read from stdin, one per line (ad-hoc list)
       -all               include subdirectories recursively (also --all); applies
                          to the cwd, to directory args, and to a single file arg
                          (its parent is listed recursively, starting at the file)
-      -sort name|mtime   (default name)
+      -sort name|mtime|date  (default name; date = EXIF date taken, files
+                         without one by mtime; mtime and date are flat over the tree)
+      -out DIR           copy destination for marked files (Enter, and on quit)
       -fullscreen        start fullscreen
       -sidebar=false     start with sidebar hidden
       -version
 
-Exit 1 with a one-line stderr message when nothing viewable is found.
-Decode failures are not fatal.
+Exit 1 with a one-line stderr message when nothing viewable is found, or
+when the exit copy to -out fails. Decode failures are not fatal. Stdout
+carries only the marked paths printed at exit.
 
 ## Build
 

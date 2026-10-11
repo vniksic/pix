@@ -14,13 +14,14 @@ import (
 const version = "0.1.0"
 
 func main() {
-	sortFlag := flag.String("sort", "name", "sort order: name|mtime")
+	sortFlag := flag.String("sort", "name", "sort order: name|mtime|date (date taken, else mtime)")
+	outDir := flag.String("out", "", "copy marked files (m) into `DIR` on Enter and on quit")
 	all := flag.Bool("all", false, "include subdirectories, recursively")
 	fullscreen := flag.Bool("fullscreen", false, "start fullscreen")
 	sidebar := flag.Bool("sidebar", true, "start with the sidebar visible")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: pix [flags] [path ...]\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: pix [flags] [path ...]\n       pix [flags] -     (read paths from stdin)\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -36,12 +37,19 @@ func main() {
 		order = scan.SortName
 	case "mtime":
 		order = scan.SortMTime
+	case "date":
+		order = scan.SortDate
 	default:
-		fmt.Fprintf(os.Stderr, "pix: -sort must be name or mtime, not %q\n", *sortFlag)
+		fmt.Fprintf(os.Stderr, "pix: -sort must be name, mtime or date, not %q\n", *sortFlag)
 		os.Exit(2)
 	}
 
-	entries, start, roots, err := scan.Resolve(flag.Args(), scan.Options{Sort: order, Recursive: *all})
+	// The marked files are printed to stdout on exit. Keep the real stdout
+	// for that alone and point fd 1 at stderr, so nothing else (Fyne, GL
+	// drivers, C decoders, children) can write into a pipe.
+	stdout := reserveStdout()
+
+	entries, start, roots, err := scan.Resolve(flag.Args(), scan.Options{Sort: order, Recursive: *all, Taken: imgload.Taken})
 	if err == nil && len(entries) == 0 {
 		err = fmt.Errorf("no images found")
 	}
@@ -63,6 +71,8 @@ func main() {
 		Fullscreen: *fullscreen,
 		Sidebar:    *sidebar,
 		Loader:     imgload.NewLoader(6, 2),
+		OutDir:     *outDir,
+		Stdout:     stdout,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pix: %v\n", err)

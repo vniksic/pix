@@ -11,7 +11,6 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
-	"io"
 	"os"
 
 	"github.com/gen2brain/avif"
@@ -36,10 +35,27 @@ const maxPixels = 1 << 28 // 268 MP, ~1 GiB as NRGBA
 //
 // HEIC, AVIF and JPEG XL orientation is applied by their decoders. The
 // result's bounds always start at (0,0).
-func Decode(path string) (img *image.NRGBA, err error) {
+func Decode(path string) (*image.NRGBA, error) {
+	return decodeFile(path, nil)
+}
+
+// decodeWithMeta is Decode that also extracts Meta from the bytes it has
+// already read (no second read of the file). Meta is filled even when
+// decoding fails.
+func decodeWithMeta(path string) (*image.NRGBA, Meta, error) {
+	var m Meta
+	img, err := decodeFile(path, &m)
+	return img, m, err
+}
+
+// decodeFile implements Decode, filling *meta when meta is non-nil.
+func decodeFile(path string, meta *Meta) (img *image.NRGBA, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+	if meta != nil {
+		*meta = metaFrom(bytes.NewReader(data), int64(len(data)))
 	}
 	defer func() {
 		if r := recover(); r != nil {
@@ -191,24 +207,5 @@ func exifOrientation(format string, data []byte) (o int) {
 
 // webpExif returns the payload of the EXIF chunk of a RIFF/WebP file.
 func webpExif(data []byte) []byte {
-	if len(data) < 12 {
-		return nil
-	}
-	r := bytes.NewReader(data[12:])
-	var hdr [8]byte
-	for {
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			return nil
-		}
-		size := int64(binary.LittleEndian.Uint32(hdr[4:]))
-		if size > int64(r.Len()) {
-			return nil
-		}
-		if string(hdr[:4]) == "EXIF" {
-			buf := make([]byte, size)
-			io.ReadFull(r, buf)
-			return buf
-		}
-		r.Seek(size+size&1, io.SeekCurrent) // chunks are padded to even size
-	}
+	return webpExifAt(bytes.NewReader(data), int64(len(data)))
 }
