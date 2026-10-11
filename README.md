@@ -30,7 +30,7 @@ GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
 | z                                | 1:1 pixels (in fullscreen also hides the status bar until x) |
 | x                                | fit to window                            |
 | + / = / -                        | zoom in / out                            |
-| [ / ]                            | rotate 90° left / right (view only)      |
+| [ / ]                            | rotate 90° left / right (view only; remembered per photo for the session) |
 | Ctrl+C                           | copy image to clipboard (as displayed)   |
 | Ctrl+Shift+C                     | copy file path to clipboard              |
 | Tab, b                           | toggle the file list                     |

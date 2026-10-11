@@ -204,6 +204,7 @@ func (u *viewer) trashed(e scan.Entry, err error) {
 		return
 	}
 	u.loader.Invalidate(e.Path)
+	delete(u.rots, e.Path)
 	if u.pinned == e.Path {
 		u.pinned = ""
 	}

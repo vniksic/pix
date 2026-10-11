@@ -373,6 +373,15 @@ func (v *View) Rotate(dq int) {
 	v.clamp()
 }
 
+// SetRot turns the view to rotation q (any number of quarter turns), the
+// way Rotate does: Fit re-fits, other modes keep the image point at the
+// viewport centre. A no-op when already there.
+func (v *View) SetRot(q int) {
+	if d := NormQuarter(q) - v.Rot; d != 0 {
+		v.Rotate(d)
+	}
+}
+
 // Matrix returns the source->viewport matrix. At exactly 1:1 the offsets
 // are rounded so the result is a pixel-exact copy.
 func (v *View) Matrix() f64.Aff3 {

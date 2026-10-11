@@ -172,6 +172,16 @@ func (v *viewport) SetImage(img *image.NRGBA, opaque bool) {
 	v.changed()
 }
 
+// SetRot turns the view to rotation q (see View.SetRot) and redraws if
+// that changed anything.
+func (v *viewport) SetRot(q int) {
+	if NormQuarter(q) == v.view.Rot {
+		return
+	}
+	v.view.SetRot(q)
+	v.changed()
+}
+
 // SetMessage clears the image and shows a plain text message instead.
 func (v *viewport) SetMessage(msg string) {
 	v.dropMips()

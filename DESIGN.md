@@ -284,12 +284,24 @@ is centred on that axis; otherwise edges stay within the viewport.
 Cursor turns to a grab hand while dragging if Fyne supports it (desktop.Cursorable).
 
 Changing image: keep the current mode (fit stays fit; 1:1 stays 1:1 recentred;
-free zoom resets to fit). Rotation resets to 0 on image change.
+free zoom resets to fit). Rotation resets to 0 on image change, unless
+the photo has a remembered rotation (below).
 
 View lock (`l`, View.Locked): while locked, changing image keeps the mode,
 scale, rotation and pan offsets instead (offsets clamped for the new image
 size; Fit re-fits with the kept rotation), so a series of shots can be
 compared at the same spot. "loading"/error messages keep the rotation too.
+
+Remembered rotation: `[` / `]` store the resulting rotation (0..3, 0
+included) for the current photo in a map on the viewer, keyed by absolute
+path, in memory only (never written to disk). When an image is installed
+(the load loop's fyne.Do, after View.SetImage's lock logic) its rotation is
+the pure rotationFor: the remembered value for its path, else the rotation
+the lock carried over (when locked), else 0; it is applied with
+View.SetRot, which goes through Rotate (Fit re-fits). The lock still keeps
+mode, scale and pan. The map survives rescans and `--all` lists; a trashed
+file's entry is dropped, a renamed file simply starts afresh. Ctrl+C copies
+the displayed rotation, so it includes the remembered one.
 
 ### Keys (global, via Canvas().SetOnTypedKey / SetOnTypedRune / AddShortcut)
 
@@ -300,7 +312,7 @@ compared at the same spot. "loading"/error messages keep the rotation too.
     z                             1:1; in fullscreen also hides the status bar (shown again by Fit via x/double-click, or leaving fullscreen)
     x                             Fit
     + / = / -                     zoom in / out (×1.25 steps), around viewport centre
-    [ / ]                         rotate 90° CCW / CW (view only), stays in current mode (re-fit if Fit)
+    [ / ]                         rotate 90° CCW / CW (view only), stays in current mode (re-fit if Fit); remembered per photo for the session
     Ctrl+C                        copy image to clipboard (PNG, *as displayed rotation applied*)
     Ctrl+Shift+C                  copy absolute path as text
     Tab, b                        toggle sidebar (both; Fyne may eat Tab for focus)

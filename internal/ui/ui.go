@@ -129,6 +129,11 @@ type viewer struct {
 	delPrompt string
 	trashing  map[string]bool
 
+	// rots remembers, for this session only, the rotation the user chose
+	// with [ / ] for each photo, by absolute path (see rotationFor). Never
+	// reset by rescans; an entry is dropped when its file is trashed.
+	rots map[string]int
+
 	reqMu      sync.Mutex // guards reqPending and reqBusy (shared with the load goroutine)
 	reqPending *loadReq
 	reqBusy    bool
@@ -161,6 +166,7 @@ func Run(opts Options) error {
 		marks:     make(map[string]bool),
 		copied:    make(map[string]bool),
 		trashing:  make(map[string]bool),
+		rots:      make(map[string]int),
 	}
 	if opts.Dir != "" && opts.Start >= 0 && opts.Start < len(opts.Entries) {
 		u.pinned = opts.Entries[opts.Start].Path
@@ -439,6 +445,10 @@ func (u *viewer) loadLoop() {
 			} else {
 				u.taken = meta.Taken
 				u.vp.SetImage(img, opaque)
+				// After SetImage's lock logic, so a remembered rotation
+				// overrides the one the lock carried over.
+				v := &u.vp.view
+				u.vp.SetRot(rotationFor(u.rots, e.Path, v.Locked, v.Rot))
 			}
 			u.updateStatus()
 		})
@@ -841,11 +851,13 @@ func (u *viewer) typedRune(r rune) {
 	case '-':
 		v.ZoomBy(1/KeyStep, v.VW/2, v.VH/2)
 		u.vp.changed()
-	case '[':
-		v.Rotate(-1)
-		u.vp.changed()
-	case ']':
-		v.Rotate(1)
+	case '[', ']':
+		dq := 1
+		if r == '[' {
+			dq = -1
+		}
+		v.Rotate(dq)
+		u.rememberRot()
 		u.vp.changed()
 	case 'b':
 		u.toggleSidebar()
@@ -860,6 +872,14 @@ func (u *viewer) typedRune(r rune) {
 		u.openExternal()
 	case 'q':
 		u.quit()
+	}
+}
+
+// rememberRot records the current rotation for the current photo, so it
+// comes back when the photo is shown again this session.
+func (u *viewer) rememberRot() {
+	if len(u.entries) > 0 {
+		u.rots[u.entries[u.idx].Path] = u.vp.view.Rot
 	}
 }
 
