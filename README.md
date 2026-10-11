@@ -93,6 +93,18 @@ Flags go before the paths (`pix --all dir`, not `pix dir --all`). A single
     -sidebar=false     start with the file list hidden
     -version
 
+## Download
+
+Prebuilt Linux x86-64 binaries are on the
+[releases page](https://github.com/vniksic/pix/releases). Unpack and run:
+
+    tar xzf pix-*-linux-amd64.tar.gz
+    ./pix ~/Pictures
+
+It needs only what every Linux desktop already has: libc, libGL,
+libwayland-client, libX11 and libffi. For clipboard copy install
+`wl-clipboard` (Wayland) or `xclip` (X11).
+
 ## Build
 
 Needs Go 1.26 (the toolchain downloads itself if older), a C compiler, and

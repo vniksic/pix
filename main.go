@@ -11,7 +11,7 @@ import (
 	"pix/internal/ui"
 )
 
-const version = "0.1.0"
+var version = "dev" // set at build time: -ldflags "-X main.version=v0.1.0"
 
 func main() {
 	sortFlag := flag.String("sort", "name", "sort order: name|mtime|date (date taken, else mtime)")

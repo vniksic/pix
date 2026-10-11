@@ -8,8 +8,11 @@ GO     ?= go
 # and picks one at runtime, so `x11` is the same build.
 all: build
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS ?= -s -w -X main.version=$(VERSION)
+
 build:
-	$(GO) build -o $(BIN) .
+	$(GO) build -ldflags '$(LDFLAGS)' -o $(BIN) .
 
 x11: build
 

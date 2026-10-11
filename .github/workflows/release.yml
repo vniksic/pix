@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Build on an older glibc so the binary runs on more distributions.
+    container: debian:bookworm
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl tar \
+            gcc libc6-dev pkg-config libgl-dev libegl-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxinerama-dev libxi-dev libxxf86vm-dev libxkbcommon-dev \
+            libwayland-dev
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          go build -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o pix .
+          ./pix -version
+          mkdir -p dist
+          tar -C . -czf "dist/pix-${GITHUB_REF_NAME}-linux-amd64.tar.gz" pix README.md LICENSE
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
