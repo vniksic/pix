@@ -99,6 +99,8 @@ Needs Go 1.26 (the toolchain downloads itself if older), a C compiler, and
 the usual GL/X11/Wayland headers (on Debian: `libgl-dev libegl-dev
 libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev
 libxxf86vm-dev libxkbcommon-dev libwayland-dev`).
+On Arch: `base-devel go mesa libx11 libxcursor libxrandr libxinerama
+libxi libxkbcommon wayland`.
 
     make            # builds ./pix (Wayland and X11 in one binary)
     make test
