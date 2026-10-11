@@ -3,10 +3,14 @@
 A deliberately small image viewer for Linux, written in Go with Fyne. One
 binary, no config file, meant to be launched from a terminal.
 
-    pix                    # view the images in the current directory
-    pix photo.jpg          # start at photo.jpg, page through its siblings
-    pix ~/Pictures         # view a directory
-    pix a.png b.jpg c.webp # view exactly these files
+    pix                     # view the images in the current directory
+    pix --all               # ... and in all its subdirectories
+    pix photo.jpg           # start at photo.jpg, page through its siblings
+    pix ~/Pictures          # view a directory
+    pix --all ~/Pictures    # view a directory tree
+    pix a.png b.jpg c.webp  # view exactly these files
+    pix a.jpg b.jpg somedir # these files, then somedir's images
+    pix --all a.jpg somedir # same, with somedir's subdirectories too
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
 files never show up in the list. Formats: JPEG (with EXIF orientation), PNG,
@@ -34,12 +38,24 @@ GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
 Mouse: wheel zooms around the cursor, left-drag pans, Shift+left-drag pans
 four times faster, double-click toggles fit and 1:1.
 
-The directory is watched, so files that appear or vanish show up without a
-restart.
+With `--all`, a directory's own pictures come first, then each
+subdirectory in name order, so pictures from one directory stay together.
+Hidden files and directories are skipped, and symlinked directories are not
+followed. The file list shows each picture's name with its directory (relative
+to the starting directory, or to the current directory for a list of paths)
+on a second line; the title and status bar show the same path.
+
+The directory (or with `--all` the whole tree, up to 2000 directories) is
+watched, so files that appear or vanish show up without a restart. A list of
+paths is not watched; `r` re-checks it.
 
 ## Flags
 
-    -sort name|mtime   sort order (default name, natural order: img2 < img10)
+Flags go before the paths (`pix --all dir`, not `pix dir --all`).
+
+    -all               include subdirectories, recursively (also --all)
+    -sort name|mtime   sort order (default name, natural order: img2 < img10;
+                       mtime sorts the whole tree by age with --all)
     -fullscreen        start fullscreen
     -sidebar=false     start with the file list hidden
     -version

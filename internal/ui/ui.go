@@ -33,7 +33,8 @@ import (
 type Options struct {
 	Entries    []scan.Entry
 	Start      int
-	Dir        string // "" for ad-hoc lists (no watching)
+	Dir        string // listing root; "" for ad-hoc lists (no watching)
+	Recursive  bool   // Dir is listed with scan.ListTree and watched with scan.WatchTree
 	Sort       scan.Sort
 	Fullscreen bool // start fullscreen
 	Sidebar    bool // sidebar visible at start
@@ -153,9 +154,13 @@ func Run(opts Options) error {
 	}
 
 	if opts.Dir != "" {
-		stop, err := scan.Watch(opts.Dir, func() {
+		watch := scan.Watch
+		if opts.Recursive {
+			watch = scan.WatchTree
+		}
+		stop, err := watch(opts.Dir, func() {
 			seq := u.scanSeq.Add(1)
-			entries, err := scan.List(opts.Dir, opts.Sort)
+			entries, err := u.listRoot()
 			fyne.Do(func() { u.applyEntries(seq, entries, err) })
 		})
 		if err != nil {
@@ -194,14 +199,17 @@ func (u *viewer) build() {
 		})
 	}
 
-	u.list = newSideList(
-		func() int { return len(u.entries) },
-		func(id int) string {
-			if id >= 0 && id < len(u.entries) {
-				return u.entries[id].Name
-			}
-			return ""
-		})
+	label := func(id int) string {
+		if id >= 0 && id < len(u.entries) {
+			return u.entries[id].Label
+		}
+		return ""
+	}
+	// Two-line rows when directory parts can show up: always in a recursive
+	// listing (new subdirectories may appear), else only if the fixed
+	// ad-hoc list has some.
+	twoLine := (u.opts.Dir != "" && u.opts.Recursive) || hasDirParts(len(u.entries), label)
+	u.list = newSideList(func() int { return len(u.entries) }, label, twoLine)
 	u.list.onKey = u.typedKey
 	u.list.onRune = u.typedRune
 	u.list.onShortcut = u.typedShortcut
@@ -253,7 +261,7 @@ func (u *viewer) show(i int) {
 	i = max(0, min(i, len(u.entries)-1))
 	u.idx = i
 	e := u.entries[i]
-	u.win.SetTitle(e.Name)
+	u.win.SetTitle(e.Label)
 	u.syncList()
 
 	u.loadToken++
@@ -273,7 +281,7 @@ func (u *viewer) show(i int) {
 		fyne.Do(func() {
 			if tok == u.loadToken && u.loading {
 				u.loadSlow = true
-				u.vp.SetMessage("loading " + e.Name + " …")
+				u.vp.SetMessage("loading " + e.Label + " …")
 				u.updateStatus()
 			}
 		})
@@ -335,7 +343,7 @@ func (u *viewer) loadLoop() {
 			u.loading, u.loadSlow = false, false
 			if err != nil {
 				u.loadErr = err
-				u.vp.SetMessage("cannot show " + e.Name + ": " + err.Error())
+				u.vp.SetMessage("cannot show " + e.Label + ": " + err.Error())
 			} else {
 				u.vp.SetImage(img, opaque)
 			}
@@ -366,9 +374,8 @@ func (u *viewer) step(d int) {
 // rescan re-reads the directory (or re-stats an ad-hoc list) off the main
 // goroutine and applies the result.
 func (u *viewer) rescan() {
-	dir, sort := u.opts.Dir, u.opts.Sort
 	seq := u.scanSeq.Add(1)
-	if dir == "" {
+	if u.opts.Dir == "" {
 		old := append([]scan.Entry(nil), u.entries...)
 		go func() {
 			var out []scan.Entry
@@ -385,9 +392,18 @@ func (u *viewer) rescan() {
 		return
 	}
 	go func() {
-		entries, err := scan.List(dir, sort)
+		entries, err := u.listRoot()
 		fyne.Do(func() { u.applyEntries(seq, entries, err) })
 	}()
+}
+
+// listRoot reads the listing root (u.opts.Dir must be set). It touches only
+// u.opts, so it runs on any goroutine.
+func (u *viewer) listRoot() ([]scan.Entry, error) {
+	if u.opts.Recursive {
+		return scan.ListTree(u.opts.Dir, u.opts.Sort)
+	}
+	return scan.List(u.opts.Dir, u.opts.Sort)
 }
 
 // applyEntries installs a fresh listing from rescan number seq, keeping the
@@ -403,7 +419,7 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 		return
 	}
 	if u.opts.Dir != "" {
-		entries = withPinned(entries, u.pinned, u.opts.Sort)
+		entries = withPinned(entries, u.pinned, u.opts.Dir, u.opts.Sort)
 	}
 	curPath := ""
 	if u.idx >= 0 && u.idx < len(u.entries) {
@@ -463,8 +479,9 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 }
 
 // withPinned returns entries with the file at path inserted at its sorted
-// position if it is missing from the listing but still exists.
-func withPinned(entries []scan.Entry, path string, sort scan.Sort) []scan.Entry {
+// position if it is missing from the listing of root but still exists. Its
+// Label is recomputed relative to root, as the listing's are.
+func withPinned(entries []scan.Entry, path, root string, sort scan.Sort) []scan.Entry {
 	if path == "" || slices.ContainsFunc(entries, func(e scan.Entry) bool { return e.Path == path }) {
 		return entries
 	}
@@ -472,26 +489,18 @@ func withPinned(entries []scan.Entry, path string, sort scan.Sort) []scan.Entry 
 	if err != nil || !fi.Mode().IsRegular() {
 		return entries
 	}
-	p := scan.Entry{Path: path, Name: filepath.Base(path), ModTime: fi.ModTime(), Size: fi.Size()}
-	i := slices.IndexFunc(entries, func(e scan.Entry) bool { return entryLess(p, e, sort) })
+	p := scan.Entry{
+		Path:    path,
+		Name:    filepath.Base(path),
+		Label:   scan.RelLabel(root, path),
+		ModTime: fi.ModTime(),
+		Size:    fi.Size(),
+	}
+	i := slices.IndexFunc(entries, func(e scan.Entry) bool { return scan.Compare(p, e, sort) < 0 })
 	if i < 0 {
 		i = len(entries)
 	}
 	return slices.Insert(entries, i, p)
-}
-
-// entryLess orders entries the way scan.List sorts them.
-func entryLess(a, b scan.Entry, sort scan.Sort) bool {
-	if sort == scan.SortMTime && !a.ModTime.Equal(b.ModTime) {
-		return a.ModTime.Before(b.ModTime)
-	}
-	switch {
-	case scan.NaturalLess(a.Name, b.Name):
-		return true
-	case scan.NaturalLess(b.Name, a.Name):
-		return false
-	}
-	return a.Path < b.Path
 }
 
 // ---- status bar ----
@@ -538,7 +547,7 @@ func (u *viewer) updateStatus() {
 		return
 	}
 	e := u.entries[u.idx]
-	parts := []string{e.Name, fmt.Sprintf("%d/%d", u.idx+1, len(u.entries))}
+	parts := []string{e.Label, fmt.Sprintf("%d/%d", u.idx+1, len(u.entries))}
 	switch {
 	case u.loading:
 		if u.loadSlow {

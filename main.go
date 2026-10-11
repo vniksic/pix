@@ -15,6 +15,7 @@ const version = "0.1.0"
 
 func main() {
 	sortFlag := flag.String("sort", "name", "sort order: name|mtime")
+	all := flag.Bool("all", false, "include subdirectories, recursively")
 	fullscreen := flag.Bool("fullscreen", false, "start fullscreen")
 	sidebar := flag.Bool("sidebar", true, "start with the sidebar visible")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -40,7 +41,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	entries, start, dir, err := scan.Resolve(flag.Args(), order)
+	entries, start, roots, err := scan.Resolve(flag.Args(), scan.Options{Sort: order, Recursive: *all})
 	if err == nil && len(entries) == 0 {
 		err = fmt.Errorf("no images found")
 	}
@@ -49,10 +50,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	dir := "" // ad-hoc list: not watched
+	if len(roots) == 1 {
+		dir = roots[0]
+	}
 	err = ui.Run(ui.Options{
 		Entries:    entries,
 		Start:      start,
 		Dir:        dir,
+		Recursive:  *all,
 		Sort:       order,
 		Fullscreen: *fullscreen,
 		Sidebar:    *sidebar,

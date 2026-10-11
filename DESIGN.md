@@ -9,7 +9,7 @@ Module name: `pix`. Binary: `pix`. Go 1.26 (go.mod already set up, deps fetched)
 ## Layout
 
     main.go                 flags, wiring, exit codes
-    internal/scan/          directory listing, image sniffing, natural sort, dir watch
+    internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, dir watch
     internal/imgload/       decoding (all formats), EXIF orientation, async LRU cache
     internal/clipboard/     image/text copy via wl-copy (Wayland) or xclip (X11)
     internal/hypr/          Hyprland control-socket client (fullscreen on the current monitor)
@@ -29,6 +29,7 @@ package scan
 type Entry struct {
     Path    string      // absolute path
     Name    string      // base name
+    Label   string      // display path (see Resolve)
     ModTime time.Time
     Size    int64
 }
@@ -39,19 +40,47 @@ const (
     SortMTime             // oldest first; ties broken by natural name
 )
 
+type Options struct {
+    Sort      Sort
+    Recursive bool // expand directories with ListTree instead of List (-all)
+}
+
 // Resolve turns CLI args into a playlist.
-//   no args            -> cwd listing, start=0
-//   one dir            -> that dir's listing, start=0
-//   one file           -> its parent dir's listing, start=index of that file
-//                         (the file is included even if IsImage says no)
+//   no args            -> cwd listing, start=0, roots=[cwd]
+//   one dir            -> that dir's listing, start=0, roots=[dir]
+//   one file           -> its parent dir's listing, start=index of that file,
+//                         roots=[parent] (the file is included even if
+//                         IsImage says no)
 //   several args       -> ad-hoc list of exactly those paths that exist
-//                         (dirs expanded one level, non-images dropped), dir=""
+//                         (dirs expanded, non-images dropped), roots=nil
+// Directories are listed with List, or ListTree when opts.Recursive.
+// Labels: in the single-root cases, the path relative to the root
+// ("sub/dir/photo.jpg", or "photo.jpg" at the top). In ad-hoc lists, the
+// path relative to the cwd when the file is under it, else the absolute
+// path with $HOME shortened to "~". Ad-hoc lists keep argument order (each
+// expanded dir sorted internally) and drop duplicates.
 // Returns an error only when nothing is viewable.
-func Resolve(args []string, sort Sort) (entries []Entry, start int, dir string, err error)
+func Resolve(args []string, opts Options) (entries []Entry, start int, roots []string, err error)
 
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed.
+// Label = Name.
 func List(dir string, sort Sort) ([]Entry, error)
+
+// ListTree returns the readable images in root and all its subdirectories,
+// Label relative to root. Hidden files and dirs skipped; symlinked files
+// followed, symlinked dirs not (no cycles); unreadable subdirs skipped.
+// SortName: each directory's own images first (natural order), then its
+// subdirectories in natural order, each recursively, so a directory's
+// pictures stay together. SortMTime: one flat oldest-first order over the
+// whole tree, ties by path.
+func ListTree(root string, sort Sort) ([]Entry, error)
+
+// Compare is the order List and ListTree sort by (mtime for SortMTime,
+// then tree order on Label, then Path). RelLabel is the Label of path in a
+// listing rooted at root (path itself when not under root).
+func Compare(a, b Entry, sort Sort) int
+func RelLabel(root, path string) string
 
 // IsImage sniffs the first 64 bytes. Must recognise:
 // JPEG, PNG, GIF, WebP (RIFF....WEBP), BMP, TIFF (II*\0 / MM\0*),
@@ -65,6 +94,12 @@ func NaturalLess(a, b string) bool
 // Watch calls onChange (debounced ~300ms, from a goroutine) whenever files
 // appear/disappear/change in dir. stop() releases the watcher.
 func Watch(dir string, onChange func()) (stop func(), err error)
+
+// WatchTree is Watch over root and every non-hidden, non-symlinked
+// subdirectory (the tree ListTree lists). Directories created later are
+// added as they appear. At most 2000 directories are watched; past that,
+// deeper changes need `r`.
+func WatchTree(root string, onChange func()) (stop func(), err error)
 ```
 
 ### internal/imgload
@@ -132,7 +167,8 @@ package ui
 type Options struct {
     Entries    []scan.Entry
     Start      int
-    Dir        string         // "" for ad-hoc lists (no watching)
+    Dir        string         // listing root; "" for ad-hoc lists (no watching)
+    Recursive  bool           // Dir listed with ListTree, watched with WatchTree
     Sort       scan.Sort
     Fullscreen bool           // start fullscreen
     Sidebar    bool           // sidebar visible at start
@@ -145,8 +181,8 @@ func Run(opts Options) error
 
 ## UI behaviour
 
-Window: HBox( sidebar | VBox( viewport, status ) ). Sidebar fixed width ~220pt,
-hidden in fullscreen and when toggled off. Window title = file name.
+Window: HBox( sidebar | VBox( viewport, status ) ). Sidebar fixed width ~280pt,
+hidden in fullscreen and when toggled off. Window title = the entry's Label.
 Background: near-black (#111) behind the image.
 
 ### Viewport (custom Fyne widget wrapping canvas.Raster)
@@ -243,21 +279,35 @@ Escape); Fyne's flag is never read. Putting the *window* in fullscreen:
 
 ### Sidebar
 
-widget.List of file names. Current item selected and scrolled into view
+widget.List of entries. Current item selected and scrolled into view
 whenever the image changes. Clicking an item shows it. Focus must return to
 the viewport so keys keep working (unfocus the list after selection).
+
+Each item shows the Label split at its last `/`: the file name, and under
+it the directory part in smaller, dimmer text (caption size, low
+importance). widget.List needs one item height, so the template always has
+both lines; an item without a directory part hides the second line and
+centres the name. Two-line items are used in recursive single-root mode
+(new subdirectories may appear) and for ad-hoc lists where some Label has
+a directory part; otherwise (plain directory listing) items are one line.
+Long text is truncated with an ellipsis.
 
 ### Status bar
 
 One line, small text, left aligned:
-`name.jpg   12/87   4000×3000   33%   ↻90°` (rotation part only when ≠0).
+`sub/name.jpg   12/87   4000×3000   33%   ↻90°` (the Label; rotation part only when ≠0).
 Show `error: <msg>` in place of dims if decode failed (the viewport shows a
 plain message too; paging must still work past broken files).
 
 ### Directory watching
 
-If Dir != "", scan.Watch(Dir) -> re-List, keep the current file selected by
-path (if it vanished, clamp index), refresh sidebar. Also triggered by `r`.
+If Dir != "", scan.Watch(Dir) (scan.WatchTree when Recursive) -> re-List
+(ListTree when Recursive), keep the current file selected by path (if it
+vanished, clamp index), refresh sidebar. Also triggered by `r`. The file
+named on the command line stays in the list while it exists even if the
+listing leaves it out (hidden, unsniffable); it is inserted at its sorted
+position with its Label recomputed relative to Dir. Ad-hoc lists are not
+watched; `r` re-stats them.
 
 ### Prefetch
 
@@ -266,6 +316,9 @@ After showing index i, Prefetch(i+1, i-1, i+2). Loader cap 6.
 ## main.go flags
 
     pix [flags] [path ...]
+      -all               include subdirectories recursively (also --all); applies
+                         to the cwd, to directory args, and to a single file arg
+                         (its parent is listed recursively, starting at the file)
       -sort name|mtime   (default name)
       -fullscreen        start fullscreen
       -sidebar=false     start with sidebar hidden
