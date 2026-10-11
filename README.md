@@ -119,3 +119,7 @@ Fullscreen on Hyprland (Wayland, Lua or hyprlang config) goes through
 Hyprland's IPC socket, so it lands on the monitor the window is on;
 elsewhere Fyne does it, which on other Wayland compositors always picks the
 primary monitor.
+
+## License
+
+MIT, see LICENSE.
