@@ -70,7 +70,7 @@ func main() {
 		Sort:       order,
 		Fullscreen: *fullscreen,
 		Sidebar:    *sidebar,
-		Loader:     imgload.NewLoader(6, 2),
+		Loader:     imgload.NewLoader(10, 4),
 		OutDir:     *outDir,
 		Stdout:     stdout,
 	})

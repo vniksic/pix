@@ -85,6 +85,14 @@ type viewer struct {
 	loadSlow   bool // loading has taken longer than loadingDelay
 	loadErr    error
 	taken      time.Time // when the shown picture was taken (zero if unknown)
+	renderedAt time.Time // when the current image (or its error) was put on screen
+	// Paging is gated on display (see gateStep): a next/previous step that
+	// comes too early is kept as pendStep (±1, 0 = none) and run by a timer
+	// once the image has been shown for minDwell. pendSeq numbers those
+	// timers; bumping it cancels the armed one.
+	pendStep   int
+	pendSeq    uint64
+	lastDir    int // direction of the last step taken (±1), steers prefetch
 	flash      string
 	flashToken uint64
 	stopWatch  func()
@@ -167,6 +175,7 @@ func Run(opts Options) error {
 		copied:    make(map[string]bool),
 		trashing:  make(map[string]bool),
 		rots:      make(map[string]int),
+		lastDir:   1,
 	}
 	if opts.Dir != "" && opts.Start >= 0 && opts.Start < len(opts.Entries) {
 		u.pinned = opts.Entries[opts.Start].Path
@@ -213,6 +222,7 @@ func Run(opts Options) error {
 		// leave the viewer state alone (they check quitting), so Run can
 		// read it once the loop is over.
 		u.quitting = true
+		u.clearPending()
 		u.final = make([]string, len(u.entries))
 		for i, e := range u.entries {
 			u.final[i] = e.Path
@@ -309,7 +319,7 @@ func (u *viewer) build() {
 	u.list.onShortcut = u.typedShortcut
 	u.list.OnSelected = func(id int) {
 		if id != u.idx {
-			u.show(id)
+			u.jump(id)
 		}
 		// Give keyboard focus back to the viewport after a click.
 		u.focusViewport()
@@ -367,11 +377,11 @@ func (u *viewer) show(i int) {
 	u.loadErr = nil
 	u.updateStatus()
 
+	// One Prefetch call: the loader decodes its paths in the order given,
+	// ahead of anything queued earlier, so i+dir is decoded first.
 	var pre []string
-	for _, j := range []int{i + 1, i - 1, i + 2} {
-		if j >= 0 && j < len(u.entries) {
-			pre = append(pre, u.entries[j].Path)
-		}
+	for _, j := range prefetchOrder(i, len(u.entries), u.lastDir) {
+		pre = append(pre, u.entries[j].Path)
 	}
 	u.requestLoad(&loadReq{tok: tok, entry: e, prefetch: pre})
 	time.AfterFunc(loadingDelay, func() {
@@ -392,9 +402,10 @@ type loadReq struct {
 	prefetch []string
 }
 
-// requestLoad hands r to the single load goroutine. Requests coalesce: when
-// paging faster than images decode, only the newest pending one is decoded
-// next, so holding PageDown never piles up concurrent decodes.
+// requestLoad hands r to the single load goroutine. Requests coalesce: if
+// several arrive while one decodes, only the newest is decoded next. Key
+// paging is gated on display (step), so this is only a safety net for
+// jumps (Home/End, sidebar clicks, rescans).
 func (u *viewer) requestLoad(r *loadReq) {
 	u.reqMu.Lock()
 	u.reqPending = r
@@ -438,6 +449,7 @@ func (u *viewer) loadLoop() {
 				return
 			}
 			u.loading, u.loadSlow = false, false
+			u.renderedAt = time.Now()
 			if err != nil {
 				u.loadErr = err
 				u.taken = time.Time{}
@@ -451,6 +463,8 @@ func (u *viewer) loadLoop() {
 				u.vp.SetRot(rotationFor(u.rots, e.Path, v.Locked, v.Rot))
 			}
 			u.updateStatus()
+			// Also after an error, so a broken file does not stall a held key.
+			u.schedulePending()
 		})
 	}
 }
@@ -461,15 +475,67 @@ func (u *viewer) syncList() {
 	u.list.ScrollTo(u.idx)
 }
 
+// step pages by d (±1) for a next/previous key. Paging is gated on
+// display: while the current image is loading, or has been on screen for
+// less than minDwell, the step becomes the single pending step (the newest
+// direction wins) and runs when the image has been shown long enough. So a
+// held key shows every image, each for at least minDwell, while a single
+// press on an image already shown is immediate.
 func (u *viewer) step(d int) {
 	if len(u.entries) == 0 {
 		return
 	}
+	switch gateStep(u.loading, time.Since(u.renderedAt), u.pendStep != 0) {
+	case stepNow:
+		u.advance(d)
+	case stepDefer, stepReplace:
+		u.pendStep = d
+		u.schedulePending()
+	}
+}
+
+// advance shows the image d (±1) away from the current one, if any.
+func (u *viewer) advance(d int) {
 	j := u.idx + d
 	if j < 0 || j >= len(u.entries) {
 		return
 	}
+	u.lastDir = d
 	u.show(j)
+}
+
+// jump shows entry i directly (Home/End, sidebar click). It is not gated
+// and drops any pending step.
+func (u *viewer) jump(i int) {
+	u.clearPending()
+	u.show(i)
+}
+
+// schedulePending arms the timer that takes the pending step once the
+// current image has been on screen for minDwell. While the image is still
+// loading it does nothing: the load loop calls it again on rendering.
+func (u *viewer) schedulePending() {
+	if u.pendStep == 0 || u.loading || u.quitting {
+		return
+	}
+	u.pendSeq++
+	seq := u.pendSeq
+	time.AfterFunc(dwellLeft(time.Since(u.renderedAt)), func() {
+		fyne.Do(func() {
+			if seq != u.pendSeq || u.quitting || u.loading || u.pendStep == 0 {
+				return // cancelled, or a reload started (its render re-arms)
+			}
+			d := u.pendStep
+			u.pendStep = 0
+			u.advance(d)
+		})
+	})
+}
+
+// clearPending drops the pending step and cancels its timer.
+func (u *viewer) clearPending() {
+	u.pendStep = 0
+	u.pendSeq++
 }
 
 // ---- rescanning ----
@@ -556,6 +622,7 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 	}
 	if newIdx < 0 {
 		reload = true
+		u.clearPending() // the image it was relative to is gone
 		newIdx = max(0, min(u.idx, len(entries)-1))
 	}
 	u.entries = entries
@@ -578,6 +645,7 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 
 // showNone is the empty-playlist state.
 func (u *viewer) showNone() {
+	u.clearPending()
 	u.idx = 0
 	u.loadToken++
 	u.loading, u.loadSlow = false, false
@@ -797,6 +865,7 @@ func (u *viewer) fyneFullscreen(on bool) {
 
 func (u *viewer) quit() {
 	u.quitting = true
+	u.clearPending()
 	u.win.Close()
 }
 
@@ -812,9 +881,9 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 	case fyne.KeyPageUp, fyne.KeyBackspace, fyne.KeyLeft:
 		u.step(-1)
 	case fyne.KeyHome:
-		u.show(0)
+		u.jump(0)
 	case fyne.KeyEnd:
-		u.show(len(u.entries) - 1)
+		u.jump(len(u.entries) - 1)
 	case fyne.KeyTab:
 		u.toggleSidebar()
 	case fyne.KeyReturn, fyne.KeyEnter:

@@ -217,7 +217,7 @@ func (u *viewer) trashed(e scan.Entry, err error) {
 		case len(u.entries) == 0:
 			u.showNone()
 		case i == u.idx:
-			u.show(min(i, len(u.entries)-1))
+			u.jump(min(i, len(u.entries)-1)) // a pending step was relative to the trashed file
 		case i < u.idx:
 			u.idx--
 			u.syncList()

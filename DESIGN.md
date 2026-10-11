@@ -434,7 +434,23 @@ watched; `r` re-stats them.
 
 ### Prefetch
 
-After showing index i, Prefetch(i+1, i-1, i+2). Loader cap 6.
+Paging is gated on display, so a held PageDown (or any next/previous key)
+shows every image instead of skipping to wherever the key repeat got to. A
+step that arrives while the current image is still loading, or less than
+`minDwell` (100ms, a constant in internal/ui/paging.go) after it was
+rendered, is not taken but kept as the one pending step (not a queue; the
+newest direction wins). When the image renders (or its error message does)
+the pending step runs after whatever is left of the dwell. A single press on
+an image already shown is immediate. Home/End, sidebar clicks, quitting,
+trashing the current file and rescans that remove it drop the pending step.
+The load loop still coalesces requests as a safety net. The decision is the
+pure gateStep.
+
+Look-ahead follows the last step direction d (+1 until the first step):
+once image i is decoded, one Prefetch(i+d, i+2d, i+3d, i+4d, i-d) call
+(prefetchOrder) queues them in that order, ahead of older prefetches, so
+i+d is decoded first. main uses NewLoader(10, 4): four decodes in parallel,
+and a cache holding the look-ahead plus a few images behind.
 
 ## main.go flags
 
