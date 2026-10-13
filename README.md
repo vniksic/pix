@@ -25,8 +25,8 @@ while they are read.
 
 | Key                              | Action                                   |
 |----------------------------------|------------------------------------------|
-| PageDown, Space, Right, n        | next image                               |
-| PageUp, Backspace, Left, p       | previous image                           |
+| PageDown, Space, Right, Down, n  | next image                               |
+| PageUp, Backspace, Left, Up, p   | previous image                           |
 | Home / End                       | first / last image                       |
 | f                                | toggle fullscreen (enters in fit mode)   |
 | z                                | 1:1 pixels (in fullscreen also hides the status bar until x) |

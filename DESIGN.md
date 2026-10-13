@@ -222,17 +222,46 @@ package fileops
 
 type CopyResult struct {
     Src, Dst string
-    Skipped  bool  // an identical file was already there (Dst names it)
+    Skipped  bool   // an identical file was already there (Dst names it)
+    Rotated  bool   // the rotation asked for is stored in Dst's EXIF orientation
+    RotLost  string // why a rotation asked for was not stored ("png",
+                    // "jpeg: no room in EXIF", ...); Dst is then a plain copy
     Err      error
 }
 
 // CopyAll copies each src into dir (created 0755 if missing), never
 // overwriting: the destination is the base name; if that exists and is
-// byte-identical (size, then content) the copy is Skipped, else name-2.ext,
-// name-3.ext ... is tried until free. Two srcs with the same base name in
-// one call get distinct names. Copies keep the mtime; a partial copy is
-// removed on error. Results are in the order of srcs.
-func CopyAll(srcs []string, dir string) []CopyResult
+// byte-identical (size, then content) to what the copy would hold, the
+// copy is Skipped, else name-2.ext, name-3.ext ... is tried until free.
+// Two srcs with the same base name in one call get distinct names. Copies
+// keep the mtime; a partial copy is removed on error (written to a temp
+// file in dir, synced, then linked or renamed into place). Results are in
+// the order of srcs. Sources are only ever read.
+//
+// rot (nil: none) gives each src's view rotation in clockwise quarter
+// turns. A JPEG copied with a rotation gets the EXIF orientation
+// RotateOrientation(existing or 1, rot), losslessly: the copy is a
+// rewritten header followed by the source's bytes verbatim from a cut
+// point before the image data.
+//   - IFD0 has Orientation (SHORT, count 1): its value is patched in
+//     place (same length).
+//   - no Exif APP1: a minimal one ("Exif\0\0", big-endian TIFF, IFD0 with
+//     only Orientation) is inserted after SOI, after any leading APP0s
+//     (JFIF, JFXX).
+//   - Exif without Orientation: nothing inside the TIFF block moves (its
+//     offsets would break); a new IFD0 (old entries verbatim plus
+//     Orientation, sorted by tag, same next-IFD pointer) is appended at the
+//     end of the block, word aligned, and the header's first-IFD offset
+//     points at it. If the APP1 would exceed 65535 bytes: plain copy, RotLost.
+// Anything unexpected in the header (markers, lengths, byte order, IFD
+// bounds; looked for in the first MiB) and every other format: plain
+// copy with RotLost. Whole turns (rot % 4 == 0) are a plain copy.
+func CopyAll(srcs []string, dir string, rot func(src string) int) []CopyResult
+
+// RotateOrientation returns the EXIF orientation (1..8) that displays like
+// orientation o followed by q clockwise quarter turns (o outside 1..8
+// counts as 1): one turn maps 1→6→3→8→1 and 2→7→4→5→2.
+func RotateOrientation(o, q int) int
 
 // Trash moves path to the freedesktop trash: the home trash
 // ($XDG_DATA_HOME/Trash or ~/.local/share/Trash, files/ + info/*.trashinfo)
@@ -370,9 +399,11 @@ scale, rotation and pan offsets instead (offsets clamped for the new image
 size; Fit re-fits with the kept rotation), so a series of shots can be
 compared at the same spot. "loading"/error messages keep the rotation too.
 
-Remembered rotation: `[` / `]` store the resulting rotation (0..3, 0
+Remembered rotation: `[` / `]` (and `m`, marking: "this one, as shown")
+store the resulting rotation (0..3, 0
 included) for the current photo in a map on the viewer, keyed by absolute
-path, in memory only (never written to disk). When an image is installed
+path, in memory only (never written to the photo; copies to `-out`
+store it, see "Marks"). When an image is installed
 (the load loop's fyne.Do, after View.SetImage's lock logic) its rotation is
 the pure rotationFor: the remembered value for its path, else the rotation
 the lock carried over (when locked), else 0; it is applied with
@@ -385,6 +416,7 @@ the displayed rotation, so it includes the remembered one.
 
     PageDown, Space, Right, n     next image
     PageUp, Backspace, Left, p    previous image
+    Down / Up                     next / previous image (like Right / Left)
     Home / End                    first / last
     f                             toggle fullscreen; entering fullscreen -> Fit
     z                             1:1; in fullscreen also hides the status bar (shown again by Fit via x/double-click, or leaving fullscreen)
@@ -480,6 +512,17 @@ files). It is composed by the pure function statusText (tested headless).
   fileops.CopyAll, in playlist order, off the main goroutine (one copy at a
   time), then flashes `copied 3 to DIR`, `copied 2, skipped 1 (already
   there)`, or the first error. Without `-out`: `no -out directory`.
+- Each copy gets the photo's session rotation (copyRots, taken on the main
+  goroutine when the copy starts, and in OnClosed for the exit copy): the
+  remembered one from `rots` (marking also remembers the shown rotation,
+  so a photo marked under the view lock keeps the carried-over one), and
+  for the image on screen (not loading, not failed) the rotation it is
+  shown with. A rotated JPEG's copy stores it in
+  its EXIF orientation (see fileops); other formats are copied unchanged.
+  The summary adds `(2 rotated)` (copies made with it stored) and
+  `, rotation not stored for 1 (png)` (reasons, sorted and deduplicated).
+  A file already copied is skipped as before even if it was rotated
+  afterwards: rotate before copying.
 - Quitting (q, Escape, closing the window): the window's OnClosed handler
   (main goroutine, every quit path) snapshots the playlist order and sets
   `quitting`, after which callbacks leave the state alone. Once

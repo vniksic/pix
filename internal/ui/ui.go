@@ -131,8 +131,10 @@ type viewer struct {
 	// bg counts copy-out and trash goroutines; Run waits for them.
 	bg sync.WaitGroup
 	// final is the playlist (paths, in order) when the window closed, for
-	// the exit copy and the list printed to stdout.
-	final []string
+	// the exit copy and the list printed to stdout; finalRots the rotations
+	// the exit copy stores (copyRots).
+	final     []string
+	finalRots map[string]int
 	// errOut receives the exit copy summary (nil: os.Stderr).
 	errOut io.Writer
 
@@ -236,6 +238,7 @@ func Run(opts Options) error {
 		for i, e := range u.entries {
 			u.final[i] = e.Path
 		}
+		u.finalRots = u.copyRots()
 		if u.stopWatch != nil {
 			u.stopWatch()
 		}
@@ -267,7 +270,8 @@ func (u *viewer) finish() error {
 
 	var err error
 	if dir := u.opts.OutDir; dir != "" && len(pending) > 0 {
-		msg, failed := copySummary(fileops.CopyAll(pending, dir), dir)
+		rot := func(p string) int { return u.finalRots[p] }
+		msg, failed := copySummary(fileops.CopyAll(pending, dir, rot), dir)
 		if failed {
 			err = errors.New(msg)
 		} else {
@@ -989,9 +993,9 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 		u.cancelDelete()
 	}
 	switch e.Name {
-	case fyne.KeyPageDown, fyne.KeySpace, fyne.KeyRight:
+	case fyne.KeyPageDown, fyne.KeySpace, fyne.KeyRight, fyne.KeyDown:
 		u.step(1)
-	case fyne.KeyPageUp, fyne.KeyBackspace, fyne.KeyLeft:
+	case fyne.KeyPageUp, fyne.KeyBackspace, fyne.KeyLeft, fyne.KeyUp:
 		u.step(-1)
 	case fyne.KeyHome:
 		u.jump(0)

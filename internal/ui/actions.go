@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -56,6 +57,9 @@ func (u *viewer) toggleMark() {
 	u.markMu.Unlock()
 	if on {
 		u.nMarked++
+		// Marking says "this one, as shown": keep the rotation it is shown
+		// with (a locked view may have carried it over), so the copy gets it.
+		u.rememberRot()
 	} else {
 		u.nMarked--
 	}
@@ -91,12 +95,13 @@ func (u *viewer) copyMarked() {
 		}
 		return
 	}
+	rots := u.copyRots()
 	u.outBusy = true
 	u.flashMsg(fmt.Sprintf("copying %d to %s …", len(pending), dir))
 	u.bg.Add(1)
 	go func() {
 		defer u.bg.Done()
-		res := fileops.CopyAll(pending, dir)
+		res := fileops.CopyAll(pending, dir, func(p string) int { return rots[p] })
 		u.markMu.Lock()
 		for i, r := range res {
 			if r.Err == nil && i < len(pending) {
@@ -112,6 +117,21 @@ func (u *viewer) copyMarked() {
 			}
 		})
 	}()
+}
+
+// copyRots returns the rotation each photo is copied out with: the one
+// remembered for it and, for the image on screen, the one it is shown
+// with, which a locked view may have carried over without remembering it.
+// Main goroutine only; the copy gets its own map.
+func (u *viewer) copyRots() map[string]int {
+	rots := maps.Clone(u.rots)
+	if len(u.entries) > 0 && u.vp != nil && u.vp.img != nil && !u.loading && u.loadErr == nil {
+		if rots == nil {
+			rots = make(map[string]int)
+		}
+		rots[u.entries[u.idx].Path] = u.vp.view.Rot
+	}
+	return rots
 }
 
 // ---- trash ----

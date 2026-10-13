@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -85,10 +86,14 @@ func statusText(s statusInfo) string {
 
 // copySummary describes the outcome of copying marked files to dir:
 // "copied 3 to DIR", "copied 2, skipped 1 (already there)", or, when a copy
-// failed, the first error (failed is then true).
+// failed, the first error (failed is then true). Copies made with a
+// rotation stored add a note: "copied 3 to DIR (2 rotated)"; rotations
+// that could not be stored (in copies made or found) add ", rotation not
+// stored for 1 (png)".
 func copySummary(res []fileops.CopyResult, dir string) (msg string, failed bool) {
-	copied, skipped, nerr := 0, 0, 0
+	copied, skipped, nerr, rotated := 0, 0, 0, 0
 	var first error
+	var lost []string // why, per file
 	for _, r := range res {
 		switch {
 		case r.Err != nil:
@@ -96,11 +101,22 @@ func copySummary(res []fileops.CopyResult, dir string) (msg string, failed bool)
 			if first == nil {
 				first = r.Err
 			}
+			continue
 		case r.Skipped:
 			skipped++
 		default:
 			copied++
+			if r.Rotated {
+				rotated++
+			}
 		}
+		if r.RotLost != "" {
+			lost = append(lost, r.RotLost)
+		}
+	}
+	count, note := fmt.Sprintf("copied %d", copied), ""
+	if rotated > 0 {
+		note = fmt.Sprintf(" (%d rotated)", rotated)
 	}
 	switch {
 	case first != nil:
@@ -109,11 +125,17 @@ func copySummary(res []fileops.CopyResult, dir string) (msg string, failed bool)
 			msg += fmt.Sprintf(" (and %d more)", nerr-1)
 		}
 		if copied > 0 {
-			msg = fmt.Sprintf("copied %d, ", copied) + msg
+			msg = count + note + ", " + msg
 		}
 		return msg, true
 	case skipped > 0:
-		return fmt.Sprintf("copied %d, skipped %d (already there)", copied, skipped), false
+		msg = fmt.Sprintf("%s%s, skipped %d (already there)", count, note, skipped)
+	default:
+		msg = fmt.Sprintf("%s to %s%s", count, dir, note)
 	}
-	return fmt.Sprintf("copied %d to %s", copied, dir), false
+	if n := len(lost); n > 0 {
+		slices.Sort(lost)
+		msg += fmt.Sprintf(", rotation not stored for %d (%s)", n, strings.Join(slices.Compact(lost), ", "))
+	}
+	return msg, false
 }

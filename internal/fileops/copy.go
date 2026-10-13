@@ -18,6 +18,8 @@ import (
 type CopyResult struct {
 	Src, Dst string // Dst is "" when Err is set
 	Skipped  bool   // an identical file was already at Dst
+	Rotated  bool   // the rotation asked for is stored in Dst's EXIF orientation
+	RotLost  string // why a rotation asked for could not be stored ("png", "jpeg: ..."); Dst is then a plain copy
 	Err      error
 }
 
@@ -35,7 +37,13 @@ const maxSuffix = 10000
 // source's mtime and only then linked (or renamed) to its final name, so a
 // crash never leaves a partial file under that name; on error the
 // temporary file is removed. Results are in the order of srcs.
-func CopyAll(srcs []string, dir string) []CopyResult {
+//
+// rot, if not nil, gives the clockwise quarter turns a source was viewed
+// with. A JPEG copy then gets the EXIF orientation that shows it turned
+// that way (see orientJPEG; the image data is copied byte for byte);
+// other formats are copied unchanged with RotLost set. The identical-file
+// check compares against the bytes the copy would hold.
+func CopyAll(srcs []string, dir string, rot func(src string) int) []CopyResult {
 	results := make([]CopyResult, len(srcs))
 	dirErr := os.MkdirAll(dir, 0o755)
 	if dirErr == nil {
@@ -51,44 +59,95 @@ func CopyAll(srcs []string, dir string) []CopyResult {
 			results[i].Err = dirErr
 			continue
 		}
-		dst, skipped, err := copyOne(src, dir)
+		q := 0
+		if rot != nil {
+			q = rot(src)
+		}
+		r, err := copyOne(src, dir, q)
 		if err != nil {
 			results[i].Err = fmt.Errorf("copy %s: %w", src, err)
 			continue
 		}
-		results[i].Dst, results[i].Skipped = dst, skipped
+		results[i] = r
 	}
 	return results
 }
 
-// copyOne copies src into dir and returns the destination path.
-func copyOne(src, dir string) (dst string, skipped bool, err error) {
+// content is what a copy of a file holds: head, then the file's bytes
+// from offset rest on. A plain copy has no head; a rotated JPEG gets its
+// rewritten header there.
+type content struct {
+	f          *os.File
+	head       []byte
+	rest, size int64 // size: of the file f
+}
+
+// length is the length of the copy.
+func (c content) length() int64 { return int64(len(c.head)) + c.size - c.rest }
+
+// reader returns the copy's bytes from the start (it reads f with ReadAt,
+// so it never moves f's offset).
+func (c content) reader() io.Reader {
+	return io.MultiReader(bytes.NewReader(c.head), io.NewSectionReader(c.f, c.rest, c.size-c.rest))
+}
+
+// withRotation plans the copy of f (of the given size) turned by q
+// clockwise quarter turns: a JPEG with its EXIF orientation set, anything
+// else (or a JPEG pix cannot safely change) unchanged with the reason in
+// lost. f is only read.
+func withRotation(f *os.File, size int64, q int) (c content, rotated bool, lost string) {
+	c = content{f: f, size: size}
+	if q%4 == 0 {
+		return c, false, ""
+	}
+	head := make([]byte, min(size, jpegHeadMax))
+	n, err := f.ReadAt(head, 0)
+	if n < len(head) && err != nil {
+		return c, false, "read error"
+	}
+	if formatName(head) != "jpeg" {
+		return c, false, formatName(head)
+	}
+	out, cut, err := orientJPEG(head, q)
+	if err != nil {
+		return c, false, err.Error()
+	}
+	c.head, c.rest = out, int64(cut)
+	return c, true, ""
+}
+
+// copyOne copies src, turned by q quarter turns (see CopyAll), into dir.
+func copyOne(src, dir string, q int) (r CopyResult, err error) {
+	r.Src = src
 	in, err := os.Open(src)
 	if err != nil {
-		return "", false, err
+		return r, err
 	}
 	defer in.Close()
 	fi, err := in.Stat()
 	if err != nil {
-		return "", false, err
+		return r, err
 	}
 	if !fi.Mode().IsRegular() {
-		return "", false, errors.New("not a regular file")
+		return r, errors.New("not a regular file")
 	}
 	base := filepath.Base(src)
+	c, rotated, lost := withRotation(in, fi.Size(), q)
+	r.Rotated, r.RotLost = rotated, lost
 
 	// Find the first name that is free or already holds this content.
-	n, err := nextName(in, fi, dir, base, 1)
+	n, err := nextName(c, dir, base, 1)
 	if err != nil {
-		return "", false, err
+		return r, err
 	}
 	if n < 0 {
-		return filepath.Join(dir, suffixed(base, -n)), true, nil
+		r.Dst, r.Skipped = filepath.Join(dir, suffixed(base, -n)), true
+		return r, nil
 	}
 
 	tmp, err := os.CreateTemp(dir, "."+base+".*.part")
 	if err != nil {
-		return "", false, err
+		return r, err
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -97,49 +156,48 @@ func copyOne(src, dir string) (dst string, skipped bool, err error) {
 		}
 		os.Remove(tmpName) // after a successful link, or on error
 	}()
-	if _, err := in.Seek(0, io.SeekStart); err != nil {
-		return "", false, err
-	}
-	if _, err := io.Copy(tmp, in); err != nil {
-		return "", false, err
+	if _, err := io.Copy(tmp, c.reader()); err != nil {
+		return r, err
 	}
 	if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
-		return "", false, err
+		return r, err
 	}
 	if err := tmp.Sync(); err != nil {
-		return "", false, err
+		return r, err
 	}
 	err = tmp.Close()
 	tmp = nil
 	if err != nil {
-		return "", false, err
+		return r, err
 	}
 	if err := os.Chtimes(tmpName, time.Time{}, fi.ModTime()); err != nil {
-		return "", false, err
+		return r, err
 	}
 
 	for {
-		dst = filepath.Join(dir, suffixed(base, n))
+		dst := filepath.Join(dir, suffixed(base, n))
 		err := place(tmpName, dst)
 		if err == nil {
-			return dst, false, nil
+			r.Dst = dst
+			return r, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
-			return "", false, err
+			return r, err
 		}
 		// Someone created dst meanwhile: look further.
-		if n, err = nextName(in, fi, dir, base, n+1); err != nil {
-			return "", false, err
+		if n, err = nextName(c, dir, base, n+1); err != nil {
+			return r, err
 		}
 		if n < 0 {
-			return filepath.Join(dir, suffixed(base, -n)), true, nil
+			r.Dst, r.Skipped = filepath.Join(dir, suffixed(base, -n)), true
+			return r, nil
 		}
 	}
 }
 
 // nextName returns the first suffix number >= from whose name in dir is
-// free, or minus the number of one holding a copy identical to in.
-func nextName(in *os.File, fi os.FileInfo, dir, base string, from int) (int, error) {
+// free, or minus the number of one holding a copy identical to c.
+func nextName(c content, dir, base string, from int) (int, error) {
 	for n := from; n <= maxSuffix; n++ {
 		path := filepath.Join(dir, suffixed(base, n))
 		dfi, err := os.Lstat(path)
@@ -149,7 +207,7 @@ func nextName(in *os.File, fi os.FileInfo, dir, base string, from int) (int, err
 		if err != nil {
 			return 0, err
 		}
-		if dfi.Mode().IsRegular() && dfi.Size() == fi.Size() && sameContent(in, path) {
+		if dfi.Mode().IsRegular() && dfi.Size() == c.length() && sameContent(c.reader(), path) {
 			return -n, nil
 		}
 	}
@@ -172,17 +230,14 @@ func place(tmp, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// sameContent reports whether in (from its start) and the file at path
-// have the same bytes. Read errors count as different.
-func sameContent(in *os.File, path string) bool {
+// sameContent reports whether in and the file at path have the same
+// bytes. Read errors count as different.
+func sameContent(in io.Reader, path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	if _, err := in.Seek(0, io.SeekStart); err != nil {
-		return false
-	}
 	a, b := make([]byte, 64<<10), make([]byte, 64<<10)
 	for {
 		na, ea := io.ReadFull(in, a)

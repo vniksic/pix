@@ -45,6 +45,11 @@ func TestCopySummary(t *testing.T) {
 	ok := fileops.CopyResult{Src: "/a", Dst: "/out/a"}
 	skip := fileops.CopyResult{Src: "/b", Dst: "/out/b", Skipped: true}
 	bad := fileops.CopyResult{Src: "/c", Err: errors.New("disk full")}
+	rot := fileops.CopyResult{Src: "/d", Dst: "/out/d", Rotated: true}
+	png := fileops.CopyResult{Src: "/e", Dst: "/out/e", RotLost: "png"}
+	heic := fileops.CopyResult{Src: "/f", Dst: "/out/f", RotLost: "heic"}
+	skipRot := fileops.CopyResult{Src: "/g", Dst: "/out/g", Skipped: true, Rotated: true}
+	skipPNG := fileops.CopyResult{Src: "/h", Dst: "/out/h", Skipped: true, RotLost: "png"}
 	for _, c := range []struct {
 		res    []fileops.CopyResult
 		want   string
@@ -55,6 +60,11 @@ func TestCopySummary(t *testing.T) {
 		{[]fileops.CopyResult{skip}, "copied 0, skipped 1 (already there)", false},
 		{[]fileops.CopyResult{bad}, "copy failed: disk full", true},
 		{[]fileops.CopyResult{ok, bad, skip, bad}, "copied 1, copy failed: disk full (and 1 more)", true},
+		{[]fileops.CopyResult{rot, ok, rot}, "copied 3 to ../keep (2 rotated)", false},
+		{[]fileops.CopyResult{ok, png, rot}, "copied 3 to ../keep (1 rotated), rotation not stored for 1 (png)", false},
+		{[]fileops.CopyResult{heic, png, png}, "copied 3 to ../keep, rotation not stored for 3 (heic, png)", false},
+		{[]fileops.CopyResult{rot, skipRot, skipPNG}, "copied 1 (1 rotated), skipped 2 (already there), rotation not stored for 1 (png)", false},
+		{[]fileops.CopyResult{rot, bad, png}, "copied 2 (1 rotated), copy failed: disk full", true},
 	} {
 		got, failed := copySummary(c.res, "../keep")
 		if got != c.want || failed != c.failed {

@@ -3,6 +3,7 @@ package fileops
 import (
 	"bytes"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -57,7 +58,7 @@ func TestCopyAll(t *testing.T) {
 	mt := time.Date(2023, 3, 4, 5, 6, 7, 0, time.Local)
 
 	x := writeFile(t, filepath.Join(src, "a", "x.jpg"), "content A", mt)
-	res := CopyAll([]string{x}, out)
+	res := CopyAll([]string{x}, out, nil)
 	if len(res) != 1 || res[0].Err != nil || res[0].Skipped || res[0].Src != x || res[0].Dst != filepath.Join(out, "x.jpg") {
 		t.Fatalf("first copy: %+v", res)
 	}
@@ -73,14 +74,14 @@ func TestCopyAll(t *testing.T) {
 	}
 
 	// Identical file already there: skipped.
-	res = CopyAll([]string{x}, out)
+	res = CopyAll([]string{x}, out, nil)
 	if res[0].Err != nil || !res[0].Skipped || res[0].Dst != filepath.Join(out, "x.jpg") {
 		t.Errorf("identical: %+v", res)
 	}
 
 	// Same name, different content (also same size): -2.
 	x2 := writeFile(t, filepath.Join(src, "b", "x.jpg"), "content B", time.Time{})
-	res = CopyAll([]string{x2}, out)
+	res = CopyAll([]string{x2}, out, nil)
 	if res[0].Err != nil || res[0].Skipped || res[0].Dst != filepath.Join(out, "x-2.jpg") {
 		t.Errorf("collision: %+v", res)
 	}
@@ -88,7 +89,7 @@ func TestCopyAll(t *testing.T) {
 		t.Errorf("x.jpg overwritten: %q", got)
 	}
 	// ...and copying it again finds its identical -2 copy.
-	res = CopyAll([]string{x2}, out)
+	res = CopyAll([]string{x2}, out, nil)
 	if !res[0].Skipped || res[0].Dst != filepath.Join(out, "x-2.jpg") {
 		t.Errorf("identical -2: %+v", res)
 	}
@@ -97,7 +98,7 @@ func TestCopyAll(t *testing.T) {
 	writeFile(t, filepath.Join(out, "y.jpg"), "other 1", time.Time{})
 	writeFile(t, filepath.Join(out, "y-2.jpg"), "other two", time.Time{})
 	y := writeFile(t, filepath.Join(src, "y.jpg"), "mine", time.Time{})
-	res = CopyAll([]string{y}, out)
+	res = CopyAll([]string{y}, out, nil)
 	if res[0].Err != nil || res[0].Dst != filepath.Join(out, "y-3.jpg") || readFile(t, res[0].Dst) != "mine" {
 		t.Errorf("-3: %+v", res)
 	}
@@ -109,7 +110,7 @@ func TestCopyAll(t *testing.T) {
 	missing := filepath.Join(src, "missing.png")
 	noext := writeFile(t, filepath.Join(src, "e", "README"), "r", time.Time{})
 	noext2 := writeFile(t, filepath.Join(src, "f", "README"), "s", time.Time{})
-	res = CopyAll([]string{z1, missing, z2, filepath.Join(src, "c"), noext, noext2}, out)
+	res = CopyAll([]string{z1, missing, z2, filepath.Join(src, "c"), noext, noext2}, out, nil)
 	want := []struct {
 		src, dst string
 		err      bool
@@ -144,7 +145,7 @@ func TestCopyAllErrors(t *testing.T) {
 
 	// dir is a file.
 	file := writeFile(t, filepath.Join(t.TempDir(), "f"), "", time.Time{})
-	res := CopyAll([]string{src, src}, file)
+	res := CopyAll([]string{src, src}, file, nil)
 	if len(res) != 2 || res[0].Err == nil || res[1].Err == nil || res[0].Src != src {
 		t.Errorf("dir is a file: %+v", res)
 	}
@@ -158,7 +159,7 @@ func TestCopyAllErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(ro, 0o755) })
-	res = CopyAll([]string{src}, ro)
+	res = CopyAll([]string{src}, ro, nil)
 	if res[0].Err == nil || res[0].Dst != "" {
 		t.Errorf("read-only dir: %+v", res)
 	}
@@ -181,7 +182,8 @@ func TestSameContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if !sameContent(f, b) || sameContent(f, c) || sameContent(f, d) || sameContent(f, filepath.Join(dir, "none")) {
+	whole := func() io.Reader { return io.NewSectionReader(f, 0, int64(len(big))) }
+	if !sameContent(whole(), b) || sameContent(whole(), c) || sameContent(whole(), d) || sameContent(whole(), filepath.Join(dir, "none")) {
 		t.Error("sameContent wrong")
 	}
 }

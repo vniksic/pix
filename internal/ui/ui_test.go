@@ -1,7 +1,8 @@
 package ui
 
 import (
-	"io"
+	"image"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -162,16 +163,21 @@ func TestFinishCopiesAndPrintsMarked(t *testing.T) {
 		}
 		paths = append(paths, p)
 	}
-	var stdout strings.Builder
+	var stdout, stderr strings.Builder
 	u := &viewer{
 		opts:   Options{OutDir: out, Stdout: &stdout},
 		marks:  map[string]bool{paths[3]: true, paths[0]: true, paths[2]: true, "/gone.jpg": true},
 		copied: map[string]bool{paths[2]: true}, // copied earlier with Enter
 		final:  paths,
-		errOut: io.Discard,
+		// Not images, so the rotation cannot be stored, but it is passed on.
+		finalRots: map[string]int{paths[0]: 1},
+		errOut:    &stderr,
 	}
 	if err := u.finish(); err != nil {
 		t.Fatal(err)
+	}
+	if want := "pix: copied 2 to " + out + ", rotation not stored for 1 (unknown format)\n"; stderr.String() != want {
+		t.Errorf("stderr %q, want %q", stderr.String(), want)
 	}
 	if want := paths[0] + "\n" + paths[2] + "\n" + paths[3] + "\n"; stdout.String() != want {
 		t.Errorf("stdout %q, want %q", stdout.String(), want)
@@ -193,6 +199,36 @@ func TestFinishCopiesAndPrintsMarked(t *testing.T) {
 	u = &viewer{opts: Options{Stdout: &stdout}, marks: map[string]bool{}, copied: map[string]bool{}, final: paths}
 	if err := u.finish(); err != nil || stdout.Len() != 0 {
 		t.Errorf("unmarked: err %v, stdout %q", err, stdout.String())
+	}
+}
+
+// The copy-out takes the remembered rotations, and for the image on
+// screen the one it is shown with (a locked view carries it over without
+// remembering it), unless that image is still loading or failed.
+func TestCopyRots(t *testing.T) {
+	test.NewTempApp(t)
+	a, b := scan.Entry{Path: "/p/a.jpg"}, scan.Entry{Path: "/p/b.jpg"}
+	u := &viewer{
+		entries: []scan.Entry{a, b},
+		idx:     1,
+		rots:    map[string]int{a.Path: 2},
+		vp:      newViewport(),
+	}
+	u.vp.SetImage(image.NewNRGBA(image.Rect(0, 0, 4, 2)), true)
+	u.vp.SetRot(3)
+	if got := u.copyRots(); !maps.Equal(got, map[string]int{a.Path: 2, b.Path: 3}) {
+		t.Errorf("shown: %v", got)
+	}
+	if len(u.rots) != 1 {
+		t.Errorf("copyRots changed rots: %v", u.rots)
+	}
+	u.loading = true
+	if got := u.copyRots(); !maps.Equal(got, map[string]int{a.Path: 2}) {
+		t.Errorf("loading: %v", got)
+	}
+	u.entries = nil
+	if got := u.copyRots(); !maps.Equal(got, map[string]int{a.Path: 2}) {
+		t.Errorf("no entries: %v", got)
 	}
 }
 
