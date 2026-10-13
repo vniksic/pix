@@ -80,6 +80,9 @@ type viewport struct {
 	// onFirstFrame runs once, via fyne.Do, after the first frame has been
 	// generated, i.e. once the window is about to be mapped.
 	onFirstFrame func()
+	// onResized runs when the widget is given a new size after its first
+	// (the window was resized, e.g. tiled by the compositor).
+	onResized func()
 }
 
 var (
@@ -115,6 +118,9 @@ func (v *viewport) MinSize() fyne.Size { return fyne.NewSize(64, 64) }
 // Resize keeps the View's viewport size (device pixels) in step with the
 // widget size. The raster generator re-syncs with the exact texture size.
 func (v *viewport) Resize(s fyne.Size) {
+	if s != v.Size() && v.Size().Width > 0 && v.onResized != nil {
+		v.onResized()
+	}
 	v.BaseWidget.Resize(s)
 	r := v.pxRatio
 	if r <= 0 {

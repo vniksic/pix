@@ -357,6 +357,12 @@ goroutine via fyne.Do. Scan goroutines never touch viewer state.
   index changes, so it can be scrolled while a scan fills it.
 - Quitting cancels the scan and does not wait for it; the marked-path
   output and the exit copy use the playlist as it is at close.
+- After any window resize the viewport is painted twice more, 40 and
+  120ms later (viewport.onResized, viewer.repaintAfterResize). Hyprland
+  tiles a new window right after mapping it and never shows the frame
+  painted right after that resize, only a later one; without the spare
+  frames the pre-resize frame stays on screen, stretched to the tile,
+  until something else repaints.
 
 Window: HBox( sidebar | VBox( Stack( viewport, help ), status ) ). Sidebar fixed width ~280pt,
 hidden in fullscreen and when toggled off. Window title = the entry's Label.

@@ -256,6 +256,7 @@ func Run(opts Options) error {
 		u.scanCancel() // not waited for: a slow mount must not hold up quitting
 	})
 
+	u.vp.onResized = u.repaintAfterResize
 	u.win.ShowAndRun()
 	u.copies.Wait()
 	u.bg.Wait()
@@ -405,6 +406,32 @@ func (u *viewer) useTwoLines() bool {
 	u.sidebar.Objects = []fyne.CanvasObject{u.list}
 	u.sidebar.Refresh()
 	return true
+}
+
+// resizeRepaints are how long after a window resize the viewport is painted
+// once more for nothing. Hyprland tiles a new window right after mapping it
+// and then keeps showing the frame from before the resize, stretched to
+// the tile: the frame painted right after the resize is swapped and
+// acknowledged but never shown, only the next one is (Fyne 2.8, Wayland).
+// Two spare frames shortly after each resize end the stretch inside the
+// open animation; in steady state a resize costs those two frames and
+// nothing else.
+var resizeRepaints = []time.Duration{40 * time.Millisecond, 120 * time.Millisecond}
+
+// repaintAfterResize schedules resizeRepaints after the viewport changed
+// size (viewport.onResized).
+func (u *viewer) repaintAfterResize() {
+	go func() {
+		start := time.Now()
+		for _, d := range resizeRepaints {
+			time.Sleep(time.Until(start.Add(d)))
+			fyne.Do(func() {
+				if !u.quitting {
+					u.win.Canvas().Refresh(u.vp)
+				}
+			})
+		}
+	}()
 }
 
 // setHelp shows or hides the key list. Fyne registers an object with a
