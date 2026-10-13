@@ -69,6 +69,12 @@ is locked and how many images are marked.
 `-out DIR`, `Enter` copies the marked images there; files are never
 overwritten (an identical file already there is skipped, a different one
 with the same name gets `name-2.jpg`), and modification times are kept.
+The directory is created on the first copy; if the path is a file, or you
+cannot write there, pix refuses to start.
+A JPEG you rotated with `[` / `]` is copied with its EXIF orientation set,
+so it opens the way you turned it; this is lossless (only that tag
+changes, the image data is copied byte for byte). Other formats are copied
+as they are, and the status line says so.
 When pix quits (q, Escape, or closing the window) any marked images not
 copied yet are copied too, then the marked paths are printed to stdout, one
 per line, in list order, so they can be piped:

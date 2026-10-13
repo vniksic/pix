@@ -591,8 +591,15 @@ and a cache holding the look-ahead plus a few images behind.
       -sidebar=false     start with sidebar hidden
       -version
 
-Exit 1 with a one-line stderr message when nothing viewable is found, or
-when the exit copy to -out fails. Decode failures are not fatal. Stdout
+Exit 2 with a one-line stderr message for a bad flag, including an -out
+path that fileops.CheckWritable rejects (checked before the window opens:
+it must be a directory the user can write to and enter, or be missing
+below one, since the first copy creates it; access(2), so nothing is
+written and a network mount may still fail at copy time; an existing
+directory may hold files, which are never overwritten). Exit 1 when scan.Prepare fails (a path
+that does not exist, an unreadable directory, an unreadable stdin), or
+when the exit copy to -out fails. That nothing is viewable is only known once the
+window is open: it then shows "no images" and quitting exits 0. Decode failures are not fatal. Stdout
 carries only the marked paths printed at exit.
 
 ## Build

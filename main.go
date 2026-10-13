@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"pix/internal/fileops"
 	"pix/internal/imgload"
 	"pix/internal/scan"
 	"pix/internal/ui"
@@ -57,6 +58,17 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "pix: -sort must be name, mtime or date, not %q\n", *sortFlag)
 		os.Exit(2)
+	}
+
+	// The copy target is checked now so a wrong one does not come to light
+	// at Enter, or at quit after the culling is done. It need not exist
+	// yet (the first copy creates it); existing files in it are fine, a
+	// copy never overwrites them.
+	if *outDir != "" {
+		if err := fileops.CheckWritable(*outDir); err != nil {
+			fmt.Fprintf(os.Stderr, "pix: --out: %v\n", err)
+			os.Exit(2)
+		}
 	}
 
 	// The marked files are printed to stdout on exit. Keep the real stdout
