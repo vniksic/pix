@@ -1,25 +1,22 @@
 package scan
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// takenSource is the date source of the last Resolve, used by List and
-// ListTree for SortDate. nil when that Resolve had no Options.Taken.
+// takenSource is the date source of the last Resolve or Prepare, used by
+// every scan for SortDate. nil when that call had no Options.Taken.
 var takenSource atomic.Pointer[takenCache]
 
-// setTakenSource records fn (nil clears it) as the source for List and
-// ListTree and returns its cache.
-func setTakenSource(fn func(string) (time.Time, bool)) *takenCache {
+// setTakenSource records fn (nil clears it) as the source for later scans.
+func setTakenSource(fn func(string) (time.Time, bool)) {
 	var c *takenCache
 	if fn != nil {
 		c = &takenCache{fn: fn, m: make(map[string]takenRec)}
 	}
 	takenSource.Store(c)
-	return c
 }
 
 // takenCache memoizes a Taken function by path, size and mtime, so the
@@ -37,53 +34,27 @@ type takenRec struct {
 	taken time.Time
 }
 
-// fill sets Taken on entries (left zero when unknown), calling fn
-// concurrently for the ones not cached. A nil cache does nothing.
-func (c *takenCache) fill(entries []Entry) {
+// taken returns the date e was taken (zero when unknown), calling fn only
+// when the cache has nothing for e's path, size and mtime. A nil cache
+// gives zero. Safe for concurrent use.
+func (c *takenCache) taken(e Entry) time.Time {
 	if c == nil {
-		return
+		return time.Time{}
 	}
-	var todo []int
 	c.mu.Lock()
-	for i := range entries {
-		e := &entries[i]
-		if r, ok := c.m[e.Path]; ok && r.size == e.Size && r.mod.Equal(e.ModTime) {
-			e.Taken = r.taken
-		} else {
-			todo = append(todo, i)
-		}
-	}
+	r, ok := c.m[e.Path]
 	c.mu.Unlock()
-	if len(todo) == 0 {
-		return
+	if ok && r.size == e.Size && r.mod.Equal(e.ModTime) {
+		return r.taken
 	}
-
-	// Reading EXIF is mostly waiting on the disk: use a few more
-	// goroutines than CPUs.
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	for range min(len(todo), max(4, 2*runtime.GOMAXPROCS(0))) {
-		wg.Go(func() {
-			for {
-				k := int(next.Add(1) - 1)
-				if k >= len(todo) {
-					return
-				}
-				e := &entries[todo[k]]
-				if t, ok := c.fn(e.Path); ok {
-					e.Taken = t
-				}
-			}
-		})
+	var taken time.Time
+	if t, ok := c.fn(e.Path); ok {
+		taken = t
 	}
-	wg.Wait()
-
 	c.mu.Lock()
-	for _, i := range todo {
-		e := &entries[i]
-		c.m[e.Path] = takenRec{mod: e.ModTime, size: e.Size, taken: e.Taken}
-	}
+	c.m[e.Path] = takenRec{mod: e.ModTime, size: e.Size, taken: taken}
 	c.mu.Unlock()
+	return taken
 }
 
 // dateKey is what SortDate orders by: the date taken, else ModTime.

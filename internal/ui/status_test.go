@@ -31,6 +31,9 @@ func TestStatusText(t *testing.T) {
 		{"error", with(func(s *statusInfo) { s.HasImg, s.Err, s.Marked = false, errors.New("bad"), true }), "sub/a.jpg ★   12/87   error: bad"},
 		{"empty", statusInfo{Empty: true, Locked: true, Flash: "trashed a.jpg"}, "no images   lock   trashed a.jpg"},
 		{"empty plain", statusInfo{Empty: true}, "no images"},
+		{"scanning", with(func(s *statusInfo) { s.Scanning, s.NMarked = true, 1 }), "sub/a.jpg   12/87   scanning…   4000×3000   33%   1 marked"},
+		{"scanning loading", with(func(s *statusInfo) { s.Scanning, s.Loading, s.Slow = true, true, true }), "sub/a.jpg   12/87   scanning…   loading…"},
+		{"scanning empty", statusInfo{Empty: true, Scanning: true, Flash: "rescan: x"}, "scanning…   rescan: x"},
 	} {
 		if got := statusText(c.s); got != c.want {
 			t.Errorf("%s:\n got %q\nwant %q", c.name, got, c.want)

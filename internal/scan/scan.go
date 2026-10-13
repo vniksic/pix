@@ -4,6 +4,7 @@ package scan
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -33,7 +34,7 @@ const (
 	SortDate              // by date taken, oldest first; files without one use ModTime; ties as SortMTime
 )
 
-// Options configures Resolve.
+// Options configures Resolve and Prepare.
 type Options struct {
 	Sort      Sort
 	Recursive bool // expand directories with ListTree instead of List
@@ -41,6 +42,16 @@ type Options struct {
 	// SortDate. It may be called concurrently. nil makes SortDate order
 	// like SortMTime.
 	Taken func(path string) (time.Time, bool)
+}
+
+// Target is a command line resolved without listing anything (see
+// Prepare); Scan lists it.
+type Target struct {
+	Root      string   // listing root in the single-root cases; "" for an ad-hoc list
+	File      string   // the file named on its own (Root is its parent); "" otherwise
+	Paths     []string // the ad-hoc list's paths, absolute, in order (Root == "")
+	Sort      Sort
+	Recursive bool // directories are listed with ListTree
 }
 
 // Resolve turns CLI args into a playlist.
@@ -66,33 +77,14 @@ type Options struct {
 // Resolve also remembers opts.Taken (nil clears it): List and ListTree use
 // it for SortDate, so rescans keep the same order. Dates are cached by
 // path, size and modification time.
+//
+// Resolve is Prepare followed by a Scan to the end.
 func Resolve(args []string, opts Options) (entries []Entry, start int, roots []string, err error) {
-	if len(args) == 1 && args[0] == "-" {
-		return ResolveReader(os.Stdin, opts)
+	t, err := Prepare(args, opts)
+	if err != nil {
+		return nil, 0, nil, err
 	}
-	c := setTakenSource(opts.Taken)
-	switch len(args) {
-	case 0:
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		return resolveDir(cwd, opts, c)
-	case 1:
-		abs, err := filepath.Abs(args[0])
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		fi, err := os.Stat(abs)
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		if fi.IsDir() {
-			return resolveDir(abs, opts, c)
-		}
-		return resolveFile(abs, fi, opts, c)
-	}
-	return resolveAdhoc(args, opts, c)
+	return resolve(t)
 }
 
 // ResolveReader builds an ad-hoc list (as Resolve does for several
@@ -102,7 +94,82 @@ func Resolve(args []string, opts Options) (entries []Entry, start int, roots []s
 // a single path makes an ad-hoc list. roots is always nil. It is what
 // Resolve uses for the argument "-".
 func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots []string, err error) {
-	c := setTakenSource(opts.Taken)
+	t, err := PrepareReader(r, opts)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return resolve(t)
+}
+
+// resolve scans t to the end and works out the rest of Resolve's results.
+func resolve(t Target) (entries []Entry, start int, roots []string, err error) {
+	entries = final(func(emit func([]Entry, bool)) { Scan(context.Background(), t, emit) })
+	switch {
+	case len(entries) > 0:
+	case t.Root == "":
+		return nil, 0, nil, errors.New("no viewable images among the given paths")
+	case t.Recursive:
+		return nil, 0, nil, fmt.Errorf("no images in %s or below it", t.Root)
+	default:
+		return nil, 0, nil, fmt.Errorf("no images in %s", t.Root)
+	}
+	if t.Root != "" {
+		roots = []string{t.Root}
+	}
+	if t.File != "" {
+		start = max(0, indexOf(entries, t.File))
+	}
+	return entries, start, roots, nil
+}
+
+// Prepare is the part of Resolve that comes before any listing, cheap
+// enough to run before a window opens: it stats a single argument, checks
+// that a single directory (or the working directory) can be opened, and
+// reads the paths from standard input for "-". The errors it returns are
+// the ones Resolve gives up front; that nothing turns out to be viewable is
+// only known once Scan is done.
+//
+// Like Resolve, Prepare remembers opts.Taken (nil clears it) for Scan, List
+// and ListTree.
+func Prepare(args []string, opts Options) (Target, error) {
+	if len(args) == 1 && args[0] == "-" {
+		return PrepareReader(os.Stdin, opts)
+	}
+	setTakenSource(opts.Taken)
+	t := Target{Sort: opts.Sort, Recursive: opts.Recursive}
+	switch len(args) {
+	case 0:
+		cwd, err := os.Getwd()
+		if err != nil {
+			return Target{}, err
+		}
+		t.Root = cwd
+		return t, openable(cwd)
+	case 1:
+		abs, err := filepath.Abs(args[0])
+		if err != nil {
+			return Target{}, err
+		}
+		fi, err := os.Stat(abs)
+		if err != nil {
+			return Target{}, err
+		}
+		if fi.IsDir() {
+			t.Root = abs
+			return t, openable(abs)
+		}
+		// An unreadable parent is no error: the file alone is still shown.
+		t.Root, t.File = filepath.Dir(abs), abs
+		return t, nil
+	}
+	t.Paths = absPaths(args)
+	return t, nil
+}
+
+// PrepareReader is Prepare for the path list of "-", read from r (see
+// ResolveReader).
+func PrepareReader(r io.Reader, opts Options) (Target, error) {
+	setTakenSource(opts.Taken)
 	var paths []string
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -114,94 +181,29 @@ func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots
 		paths = append(paths, line)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, 0, nil, fmt.Errorf("reading path list: %w", err)
+		return Target{}, fmt.Errorf("reading path list: %w", err)
 	}
-	return resolveAdhoc(paths, opts, c)
+	return Target{Paths: absPaths(paths), Sort: opts.Sort, Recursive: opts.Recursive}, nil
 }
 
-// resolveAdhoc implements the ad-hoc list case of Resolve.
-func resolveAdhoc(args []string, opts Options, c *takenCache) (entries []Entry, start int, roots []string, err error) {
-	cwd, _ := os.Getwd()
-	home, _ := os.UserHomeDir()
-	seen := make(map[string]bool)
-	add := func(e Entry) {
-		if !seen[e.Path] {
-			seen[e.Path] = true
-			e.Label = adhocLabel(e.Path, cwd, home)
-			entries = append(entries, e)
+// absPaths makes paths absolute, dropping the ones that cannot be.
+func absPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if abs, err := filepath.Abs(p); err == nil {
+			out = append(out, abs)
 		}
 	}
-	for _, arg := range args {
-		abs, err := filepath.Abs(arg)
-		if err != nil {
-			continue
-		}
-		fi, err := os.Stat(abs)
-		if err != nil {
-			continue
-		}
-		if fi.IsDir() {
-			list, err := listDir(abs, opts, c)
-			if err != nil {
-				continue
-			}
-			for _, e := range list {
-				add(e)
-			}
-		} else if fi.Mode().IsRegular() && IsImage(abs) {
-			add(entryOf(abs, "", fi))
-		}
-	}
-	if len(entries) == 0 {
-		return nil, 0, nil, errors.New("no viewable images among the given paths")
-	}
-	if opts.Sort == SortDate {
-		c.fill(entries) // the files given directly; listed ones are cached
-	}
-	return entries, 0, nil, nil
+	return out
 }
 
-func listDir(dir string, opts Options, c *takenCache) ([]Entry, error) {
-	if opts.Recursive {
-		return listTree(dir, opts.Sort, c)
-	}
-	return list(dir, opts.Sort, c)
-}
-
-func resolveDir(dir string, opts Options, c *takenCache) ([]Entry, int, []string, error) {
-	entries, err := listDir(dir, opts, c)
+// openable reports why dir cannot be listed, without reading its entries.
+func openable(dir string) error {
+	f, err := os.Open(dir)
 	if err != nil {
-		return nil, 0, nil, err
+		return err
 	}
-	if len(entries) == 0 {
-		if opts.Recursive {
-			return nil, 0, nil, fmt.Errorf("no images in %s or below it", dir)
-		}
-		return nil, 0, nil, fmt.Errorf("no images in %s", dir)
-	}
-	return entries, 0, []string{dir}, nil
-}
-
-func resolveFile(path string, fi os.FileInfo, opts Options, c *takenCache) ([]Entry, int, []string, error) {
-	dir := filepath.Dir(path)
-	roots := []string{dir}
-	self := entryOf(path, filepath.Base(path), fi)
-	if opts.Sort == SortDate {
-		one := []Entry{self}
-		c.fill(one)
-		self = one[0]
-	}
-	entries, err := listDir(dir, opts, c)
-	if err != nil {
-		// Unreadable parent: still show the one file we were given.
-		return []Entry{self}, 0, roots, nil
-	}
-	if i := indexOf(entries, path); i >= 0 {
-		return entries, i, roots, nil
-	}
-	entries = append(entries, self)
-	sortEntries(entries, opts.Sort)
-	return entries, indexOf(entries, path), roots, nil
+	return f.Close()
 }
 
 func indexOf(entries []Entry, path string) int {
@@ -211,31 +213,11 @@ func indexOf(entries []Entry, path string) int {
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed. Each
 // Label is the file's Name. SortDate uses the Taken function of the last
-// Resolve (see there).
+// Resolve or Prepare (see there). It is ScanList run to the end.
 func List(dir string, sort Sort) ([]Entry, error) {
-	return list(dir, sort, takenSource.Load())
-}
-
-func list(dir string, sort Sort, c *takenCache) ([]Entry, error) {
-	dir, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, err
-	}
-	des, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]Entry, 0, len(des))
-	for _, de := range des {
-		if e, ok := imageEntry(dir, "", de); ok {
-			entries = append(entries, e)
-		}
-	}
-	if sort == SortDate {
-		c.fill(entries)
-	}
-	sortEntries(entries, sort)
-	return entries, nil
+	var err error
+	entries := final(func(emit func([]Entry, bool)) { err = ScanList(context.Background(), dir, sort, emit) })
+	return entries, err
 }
 
 // ListTree returns the readable images inside root and all its
@@ -248,61 +230,23 @@ func list(dir string, sort Sort, c *takenCache) ([]Entry, error) {
 // its subdirectories in natural order, each the same way, so a directory's
 // pictures stay together. SortMTime is one flat oldest-first order over the
 // whole tree, ties broken by path; so is SortDate, by date taken (Taken of
-// the last Resolve) falling back to ModTime.
+// the last Resolve or Prepare) falling back to ModTime. It is ScanTree run
+// to the end.
 func ListTree(root string, sort Sort) ([]Entry, error) {
-	return listTree(root, sort, takenSource.Load())
+	var err error
+	entries := final(func(emit func([]Entry, bool)) { err = ScanTree(context.Background(), root, sort, emit) })
+	return entries, err
 }
 
-func listTree(root string, sort Sort, c *takenCache) ([]Entry, error) {
-	root, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
-	des, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
-	}
-	var entries []Entry
-	var walk func(dir, rel string, des []os.DirEntry)
-	walk = func(dir, rel string, des []os.DirEntry) {
-		for _, de := range des {
-			name := de.Name()
-			if strings.HasPrefix(name, ".") {
-				continue
-			}
-			if de.IsDir() { // a real directory; symlinks report their own type
-				sub := filepath.Join(dir, name)
-				if subDes, err := os.ReadDir(sub); err == nil {
-					walk(sub, joinRel(rel, name), subDes)
-				}
-				continue
-			}
-			if e, ok := imageEntry(dir, rel, de); ok {
-				entries = append(entries, e)
-			}
+// final runs a scan to the end and returns its last snapshot.
+func final(scan func(emit func([]Entry, bool))) []Entry {
+	var out []Entry
+	scan(func(entries []Entry, done bool) {
+		if done {
+			out = entries
 		}
-	}
-	walk(root, "", des)
-	if sort == SortDate {
-		c.fill(entries)
-	}
-	sortEntries(entries, sort)
-	return entries, nil
-}
-
-// imageEntry returns the entry for de inside dir when it is a visible,
-// readable image file (following symlinks). rel is dir relative to the
-// listing root ("" for the root itself) and prefixes the Label.
-func imageEntry(dir, rel string, de os.DirEntry) (Entry, bool) {
-	if strings.HasPrefix(de.Name(), ".") {
-		return Entry{}, false
-	}
-	path := filepath.Join(dir, de.Name())
-	fi, err := os.Stat(path) // follows symlinks
-	if err != nil || !fi.Mode().IsRegular() || !IsImage(path) {
-		return Entry{}, false
-	}
-	return entryOf(path, joinRel(rel, de.Name()), fi), true
+	})
+	return out
 }
 
 func joinRel(rel, name string) string {

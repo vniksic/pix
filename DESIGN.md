@@ -71,10 +71,57 @@ type Options struct {
 // Resolve remembers opts.Taken so later List/ListTree rescans keep the
 // SortDate order.
 // Returns an error only when nothing is viewable.
+// Resolve is Prepare followed by Scan to the end.
 func Resolve(args []string, opts Options) (entries []Entry, start int, roots []string, err error)
 
 // ResolveReader is what "-" uses (paths read from r); for tests.
 func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots []string, err error)
+
+// Target is a command line resolved without listing anything.
+type Target struct {
+    Root      string   // listing root of the single-root cases; "" for an ad-hoc list
+    File      string   // the file named on its own (Root is its parent); "" otherwise
+    Paths     []string // ad-hoc list: the paths, absolute, in argument order
+    Sort      Sort
+    Recursive bool
+}
+
+// Prepare is the cheap front half of Resolve, run before the window
+// opens: it stats a single argument, checks that a single directory (or
+// the cwd) can be opened (no entries read), and reads stdin for "-".
+// Its errors: a missing path, an unreadable directory, an unreadable
+// stdin. Missing paths in an ad-hoc list are no error (skipped by Scan).
+// Remembers opts.Taken like Resolve.
+func Prepare(args []string, opts Options) (Target, error)
+func PrepareReader(r io.Reader, opts Options) (Target, error)
+
+// Scan lists t like Resolve, delivering the growing playlist to emit.
+// Each call gets a fresh slice (never touched again) holding exactly the
+// entries fully processed so far (stat + sniff + Taken for SortDate), in
+// their final order, labelled as Resolve labels them; nothing is emitted
+// before it is sniffed, so an entry never appears and then vanishes. The
+// first snapshot goes out as soon as 8 entries are in, later ones at most
+// every 100ms, and the last one has done=true (exactly once). Calls are
+// sequential, on the caller's goroutine. Cancelling ctx stops new file
+// work and returns at once; emit is not called again. t.File is in every
+// snapshot; an unreadable root gives an empty listing (but for t.File).
+func Scan(ctx context.Context, t Target, emit func(entries []Entry, done bool))
+
+// ScanList and ScanTree are List and ListTree delivering snapshots like
+// Scan. An unreadable dir/root is returned as the error, with no emit.
+// List and ListTree are these run to the end.
+func ScanList(ctx context.Context, dir string, sort Sort, emit func(entries []Entry, done bool)) error
+func ScanTree(ctx context.Context, root string, sort Sort, emit func(entries []Entry, done bool)) error
+
+// How the streaming scans work: directory reads are sequential on one
+// goroutine (the tree walk feeds files as it goes); the per-file work
+// (stat, sniff, Taken) runs on a pool of 16 workers (const workers). A
+// listing is one group sorted with Compare; an ad-hoc list has one group
+// per argument (an expanded directory sorted within its group, labelled
+// with its own listing's labels for sorting and relabelled for the
+// snapshot), groups in argument order, duplicates dropped at discovery,
+// so worker timing never changes the order. The ad-hoc arguments are
+// stat'ed concurrently ahead of the in-order discovery (statAll).
 
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed.
@@ -225,11 +272,9 @@ var ErrNoBackend = errors.New("clipboard: neither wl-copy nor xclip found")
 package ui
 
 type Options struct {
-    Entries    []scan.Entry
-    Start      int
-    Dir        string         // listing root; "" for ad-hoc lists (no watching)
-    Recursive  bool           // Dir listed with ListTree, watched with WatchTree
-    Sort       scan.Sort
+    Target     scan.Target    // what to show (scan.Prepare); scanned by the viewer.
+                              // Target.Root is watched (WatchTree when Recursive);
+                              // ad-hoc lists are not
     Fullscreen bool           // start fullscreen
     Sidebar    bool           // sidebar visible at start
     Loader     *imgload.Loader
@@ -244,6 +289,39 @@ func Run(opts Options) error
 ```
 
 ## UI behaviour
+
+### Startup and scanning
+
+main only runs scan.Prepare before the window opens, so the window is up
+at once however big or slow the directory. The file named on the command
+line (Target.File) is stat'ed and shown immediately; everything else
+arrives from a background scan.Scan whose snapshots go through the same
+path as rescans: startScan (cancels the scan in progress, numbers the
+new one in scanSeq, main goroutine only) and applyEntries on the main
+goroutine via fyne.Do. Scan goroutines never touch viewer state.
+
+- applyEntries drops snapshots of any scan older than the latest started;
+  every snapshot of the latest one applies. The current image is kept by
+  path, so its index and the count move as entries sort in before it.
+- Until a scan's last snapshot, the entries of the current playlist that
+  it has not reached yet keep their place (mergeListing), so a rescan on a
+  slow mount never empties the list; files that are gone leave with the
+  last snapshot. Files trashed while a scan runs are filtered out of its
+  snapshots.
+- The pinned file is added to every listing snapshot by withPinned on the
+  scan goroutine (it may stat the file).
+- While the scan of the startup (or a rescan that has delivered a partial
+  snapshot) runs, the status line has a `scanning…` part, and an empty
+  playlist shows "scanning…" in the viewport; "no images" only once the
+  scan is done. A scan that finds nothing leaves the window open on "no
+  images" (exit code 0 on quit).
+- The sidebar is built before the list is known: an ad-hoc list
+  switches to two-line rows (a new list widget) once a label with a
+  directory part arrives.
+- The sidebar is reselected (and scrolled) only when the current entry's
+  index changes, so it can be scrolled while a scan fills it.
+- Quitting cancels the scan and does not wait for it; the marked-path
+  output and the exit copy use the playlist as it is at close.
 
 Window: HBox( sidebar | VBox( viewport, status ) ). Sidebar fixed width ~280pt,
 hidden in fullscreen and when toggled off. Window title = the entry's Label.
@@ -383,9 +461,11 @@ Long text is truncated with an ellipsis. A marked entry's name starts with
 
 One line, small text, left aligned, parts three spaces apart:
 
-    sub/name.jpg ★   12/87   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <message>
+    sub/name.jpg ★   12/87   scanning…   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <message>
 
-The Label, "★" when the image is marked, position, dimensions, date taken
+The Label, "★" when the image is marked, position, "scanning…" while the
+playlist is still being filled in (statusInfo.Scanning; with no images
+yet it replaces "no images"), dimensions, date taken
 (EXIF, "2006-01-02 15:04", only when present), zoom, rotation (only when
 ≠0), "lock" while the view is locked, "N marked" when N > 0, and a transient
 message (2s). Show `error: <msg>` in place of dims if decode failed (the
@@ -424,13 +504,15 @@ files). It is composed by the pure function statusText (tested headless).
 
 ### Directory watching
 
-If Dir != "", scan.Watch(Dir) (scan.WatchTree when Recursive) -> re-List
-(ListTree when Recursive), keep the current file selected by path (if it
-vanished, clamp index), refresh sidebar. Also triggered by `r`. The file
+If Target.Root != "", scan.Watch(Root) (scan.WatchTree when Recursive) ->
+rescan on the main goroutine: startScan with scan.ScanList (ScanTree when
+Recursive), applied snapshot by snapshot as above; keep the current file
+selected by path (if it vanished, clamp index), refresh sidebar. Also
+triggered by `r` (also while the startup scan runs: it is replaced). The file
 named on the command line stays in the list while it exists even if the
 listing leaves it out (hidden, unsniffable); it is inserted at its sorted
-position with its Label recomputed relative to Dir. Ad-hoc lists are not
-watched; `r` re-stats them.
+position with its Label recomputed relative to Root. Ad-hoc lists are not
+watched; `r` re-stats them (ignored while the startup scan still runs).
 
 ### Prefetch
 

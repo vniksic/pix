@@ -205,6 +205,7 @@ func (u *viewer) trashed(e scan.Entry, err error) {
 	}
 	u.loader.Invalidate(e.Path)
 	delete(u.rots, e.Path)
+	u.gone[e.Path] = true // a scan in progress may have listed it already
 	if u.pinned == e.Path {
 		u.pinned = ""
 	}

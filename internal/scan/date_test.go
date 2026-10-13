@@ -15,6 +15,7 @@ var t0 = time.Date(2024, 5, 1, 12, 0, 0, 0, time.Local)
 // fakeTaken returns dates by base name and counts calls per path.
 type fakeTaken struct {
 	dates map[string]time.Time
+	delay time.Duration // per call, to make a scan slow
 	mu    sync.Mutex
 	calls map[string]int
 }
@@ -27,6 +28,7 @@ func (f *fakeTaken) taken(path string) (time.Time, bool) {
 	f.mu.Lock()
 	f.calls[path]++
 	f.mu.Unlock()
+	time.Sleep(f.delay)
 	t, ok := f.dates[filepath.Base(path)]
 	return t, ok
 }

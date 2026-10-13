@@ -64,25 +64,17 @@ func main() {
 	// drivers, C decoders, children) can write into a pipe.
 	stdout := reserveStdout()
 
-	entries, start, roots, err := scan.Resolve(flag.Args(), scan.Options{Sort: order, Recursive: *all, Taken: imgload.Taken})
-	if err == nil && len(entries) == 0 {
-		err = fmt.Errorf("no images found")
-	}
+	// Only the cheap checks happen here (a missing path, an unreadable
+	// directory or stdin); the listing itself fills in once the window is
+	// open, which may end in "no images".
+	target, err := scan.Prepare(flag.Args(), scan.Options{Sort: order, Recursive: *all, Taken: imgload.Taken})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pix: %v\n", err)
 		os.Exit(1)
 	}
 
-	dir := "" // ad-hoc list: not watched
-	if len(roots) == 1 {
-		dir = roots[0]
-	}
 	err = ui.Run(ui.Options{
-		Entries:    entries,
-		Start:      start,
-		Dir:        dir,
-		Recursive:  *all,
-		Sort:       order,
+		Target:     target,
 		Fullscreen: *fullscreen,
 		Sidebar:    *sidebar,
 		Loader:     imgload.NewLoader(10, 4),

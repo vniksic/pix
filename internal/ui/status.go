@@ -13,39 +13,46 @@ const takenLayout = "2006-01-02 15:04"
 
 // statusInfo is everything the status line shows; statusText composes it.
 type statusInfo struct {
-	Empty   bool // no images: everything up to the image details is replaced by "no images"
-	Label   string
-	Marked  bool // the current entry is marked
-	Index   int  // 0-based position of the current entry
-	Count   int  // entries in the playlist
-	Loading bool // a decode is in progress (details hidden)
-	Slow    bool // ... and has taken long enough to say so
-	Err     error
-	HasImg  bool // image details below are valid
-	W, H    int
-	Taken   time.Time // zero when unknown
-	Percent int
-	Rot     int // clockwise quarter turns
-	Locked  bool
-	NMarked int
-	Flash   string
+	Empty    bool // no images: everything up to the image details is replaced by "no images" (or "scanning…")
+	Scanning bool // the playlist is still being filled in
+	Label    string
+	Marked   bool // the current entry is marked
+	Index    int  // 0-based position of the current entry
+	Count    int  // entries in the playlist
+	Loading  bool // a decode is in progress (details hidden)
+	Slow     bool // ... and has taken long enough to say so
+	Err      error
+	HasImg   bool // image details below are valid
+	W, H     int
+	Taken    time.Time // zero when unknown
+	Percent  int
+	Rot      int // clockwise quarter turns
+	Locked   bool
+	NMarked  int
+	Flash    string
 }
 
 // statusText composes the status line:
 //
-//	label ★   12/87   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <flash>
+//	label ★   12/87   scanning…   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <flash>
 //
 // Parts that do not apply are left out.
 func statusText(s statusInfo) string {
 	var parts []string
-	if s.Empty {
+	switch {
+	case s.Empty && s.Scanning:
+		parts = append(parts, "scanning…")
+	case s.Empty:
 		parts = append(parts, "no images")
-	} else {
+	default:
 		label := s.Label
 		if s.Marked {
 			label += " ★"
 		}
 		parts = append(parts, label, fmt.Sprintf("%d/%d", s.Index+1, s.Count))
+		if s.Scanning {
+			parts = append(parts, "scanning…")
+		}
 		switch {
 		case s.Loading:
 			if s.Slow {

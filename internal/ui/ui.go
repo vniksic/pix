@@ -4,6 +4,7 @@ package ui
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"image/color"
@@ -34,11 +35,10 @@ import (
 
 // Options configures Run.
 type Options struct {
-	Entries    []scan.Entry
-	Start      int
-	Dir        string // listing root; "" for ad-hoc lists (no watching)
-	Recursive  bool   // Dir is listed with scan.ListTree and watched with scan.WatchTree
-	Sort       scan.Sort
+	// Target is what to show (scan.Prepare). The viewer scans it in the
+	// background; Target.File is shown at once. Target.Root is watched
+	// (with scan.WatchTree when Target.Recursive); ad-hoc lists are not.
+	Target     scan.Target
 	Fullscreen bool // start fullscreen
 	Sidebar    bool // sidebar visible at start
 	Loader     *imgload.Loader
@@ -98,13 +98,19 @@ type viewer struct {
 	stopWatch  func()
 	quitting   bool
 
-	// scanSeq numbers rescans as they start (from `r` or the watcher);
-	// applyEntries ignores a listing older than the last one applied.
-	scanSeq     atomic.Uint64
-	scanApplied uint64
+	// scanSeq numbers scans as they start (the first one, then `r` and
+	// the watcher); applyEntries ignores snapshots of all but the latest,
+	// and starting one cancels the one before (scanCancel).
+	scanSeq    uint64
+	scanCancel context.CancelFunc
+	scanning   bool // the playlist is still being filled in
+	// gone holds the files trashed since the latest scan started: it may
+	// have listed them before they went.
+	gone map[string]bool
 	// pinned is the file named on the command line: kept in the playlist
 	// while it exists even if List would leave it out (hidden, unsniffable).
-	pinned string
+	pinned  string
+	twoLine bool // sidebar rows have room for a directory part
 
 	// copies counts clipboard hand-offs in flight; Run waits for them so
 	// quitting right after Ctrl+C does not cut the data off mid-pipe.
@@ -169,16 +175,20 @@ func Run(opts Options) error {
 		app:       a,
 		win:       a.NewWindow("pix"),
 		loader:    opts.Loader,
-		entries:   opts.Entries,
 		sidebarOn: opts.Sidebar,
 		marks:     make(map[string]bool),
 		copied:    make(map[string]bool),
 		trashing:  make(map[string]bool),
 		rots:      make(map[string]int),
+		gone:      make(map[string]bool),
 		lastDir:   1,
+		scanning:  true,
 	}
-	if opts.Dir != "" && opts.Start >= 0 && opts.Start < len(opts.Entries) {
-		u.pinned = opts.Entries[opts.Start].Path
+	if t := opts.Target; t.File != "" {
+		// Shown before anything else is read; the scan sorts the rest in
+		// around it.
+		u.pinned = t.File
+		u.entries = withPinned(nil, t.File, t.Root, t.Sort)
 	}
 	u.build()
 	u.hypr = onWayland && hypr.Available()
@@ -194,24 +204,23 @@ func Run(opts Options) error {
 		u.setFullscreen(true)
 	}
 	if len(u.entries) > 0 {
-		u.show(opts.Start)
+		u.show(0)
 	} else {
-		u.vp.SetMessage("no images")
-		u.updateStatus()
+		u.showNone() // "scanning…" until the first snapshot
 	}
+	u.startScan(func(ctx context.Context, emit func([]scan.Entry, bool)) error {
+		scan.Scan(ctx, opts.Target, emit)
+		return nil
+	})
 
-	if opts.Dir != "" {
+	if root := opts.Target.Root; root != "" {
 		watch := scan.Watch
-		if opts.Recursive {
+		if opts.Target.Recursive {
 			watch = scan.WatchTree
 		}
-		stop, err := watch(opts.Dir, func() {
-			seq := u.scanSeq.Add(1)
-			entries, err := u.listRoot()
-			fyne.Do(func() { u.applyEntries(seq, entries, err) })
-		})
+		stop, err := watch(root, func() { fyne.Do(u.rescan) })
 		if err != nil {
-			log.Printf("pix: watching %s: %v", opts.Dir, err)
+			log.Printf("pix: watching %s: %v", root, err)
 		} else {
 			u.stopWatch = stop
 		}
@@ -230,6 +239,7 @@ func Run(opts Options) error {
 		if u.stopWatch != nil {
 			u.stopWatch()
 		}
+		u.scanCancel() // not waited for: a slow mount must not hold up quitting
 	})
 
 	u.win.ShowAndRun()
@@ -302,28 +312,12 @@ func (u *viewer) build() {
 		})
 	}
 
-	label := func(id int) string {
-		if id >= 0 && id < len(u.entries) {
-			return u.entries[id].Label
-		}
-		return ""
-	}
 	// Two-line rows when directory parts can show up: always in a recursive
-	// listing (new subdirectories may appear), else only if the fixed
-	// ad-hoc list has some.
-	twoLine := (u.opts.Dir != "" && u.opts.Recursive) || hasDirParts(len(u.entries), label)
-	u.list = newSideList(func() int { return len(u.entries) }, label, u.isMarkedAt, twoLine)
-	u.list.onKey = u.typedKey
-	u.list.onKeyDown = u.keyDown
-	u.list.onRune = u.typedRune
-	u.list.onShortcut = u.typedShortcut
-	u.list.OnSelected = func(id int) {
-		if id != u.idx {
-			u.jump(id)
-		}
-		// Give keyboard focus back to the viewport after a click.
-		u.focusViewport()
-	}
+	// listing (new subdirectories may appear); an ad-hoc list switches to
+	// them when its scan finds some (see applyEntries).
+	t := u.opts.Target
+	u.twoLine = t.Root != "" && t.Recursive
+	u.list = u.newList()
 
 	u.status = widget.NewLabel("")
 	u.status.SizeName = theme.SizeNameCaptionText
@@ -348,6 +342,43 @@ func (u *viewer) build() {
 	c.AddShortcut(shortcutCtrlC, u.typedShortcut)
 	c.AddShortcut(shortcutCopyPath, u.typedShortcut)
 	u.focusViewport()
+}
+
+// newList makes the sidebar list, with two-line rows if u.twoLine.
+func (u *viewer) newList() *sideList {
+	label := func(id int) string {
+		if id >= 0 && id < len(u.entries) {
+			return u.entries[id].Label
+		}
+		return ""
+	}
+	l := newSideList(func() int { return len(u.entries) }, label, u.isMarkedAt, u.twoLine)
+	l.onKey = u.typedKey
+	l.onKeyDown = u.keyDown
+	l.onRune = u.typedRune
+	l.onShortcut = u.typedShortcut
+	l.OnSelected = func(id int) {
+		if id != u.idx {
+			u.jump(id)
+		}
+		// Give keyboard focus back to the viewport after a click.
+		u.focusViewport()
+	}
+	return l
+}
+
+// useTwoLines switches the sidebar to two-line rows once the playlist has
+// a label with a directory part. A row's height is fixed by its template,
+// so that takes a new list widget.
+func (u *viewer) useTwoLines() bool {
+	if u.twoLine || !hasDirParts(len(u.entries), func(i int) string { return u.entries[i].Label }) {
+		return false
+	}
+	u.twoLine = true
+	u.list = u.newList()
+	u.sidebar.Objects = []fyne.CanvasObject{u.list}
+	u.sidebar.Refresh()
+	return true
 }
 
 func (u *viewer) focusViewport() {
@@ -538,57 +569,101 @@ func (u *viewer) clearPending() {
 	u.pendSeq++
 }
 
-// ---- rescanning ----
+// ---- scanning ----
 
-// rescan re-reads the directory (or re-stats an ad-hoc list) off the main
-// goroutine and applies the result.
+// rescan re-reads the directory (or re-stats an ad-hoc list) in the
+// background and applies the result.
 func (u *viewer) rescan() {
-	seq := u.scanSeq.Add(1)
-	if u.opts.Dir == "" {
-		old := append([]scan.Entry(nil), u.entries...)
-		go func() {
-			var out []scan.Entry
-			for _, e := range old {
-				fi, err := os.Stat(e.Path)
-				if err != nil || fi.IsDir() {
-					continue
-				}
-				e.ModTime, e.Size = fi.ModTime(), fi.Size()
-				out = append(out, e)
-			}
-			fyne.Do(func() { u.applyEntries(seq, out, nil) })
-		}()
+	if u.quitting {
 		return
 	}
+	if u.opts.Target.Root != "" {
+		u.startScan(u.listRoot)
+		return
+	}
+	if u.scanning {
+		return // the list is being read afresh anyway
+	}
+	old := slices.Clone(u.entries)
+	u.startScan(func(ctx context.Context, emit func([]scan.Entry, bool)) error {
+		var out []scan.Entry
+		for _, e := range old {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fi, err := os.Stat(e.Path)
+			if err != nil || fi.IsDir() {
+				continue
+			}
+			e.ModTime, e.Size = fi.ModTime(), fi.Size()
+			out = append(out, e)
+		}
+		emit(out, true)
+		return nil
+	})
+}
+
+// listRoot lists the listing root (Target.Root must be set). It touches
+// only u.opts, so it runs on any goroutine.
+func (u *viewer) listRoot(ctx context.Context, emit func([]scan.Entry, bool)) error {
+	t := u.opts.Target
+	if t.Recursive {
+		return scan.ScanTree(ctx, t.Root, t.Sort, emit)
+	}
+	return scan.ScanList(ctx, t.Root, t.Sort, emit)
+}
+
+// startScan cancels the scan in progress, if any, and runs list on a
+// goroutine, applying each snapshot it emits. An error from list (an
+// unreadable root) is applied as the scan's end.
+func (u *viewer) startScan(list func(ctx context.Context, emit func([]scan.Entry, bool)) error) {
+	if u.scanCancel != nil {
+		u.scanCancel()
+	}
+	u.scanSeq++
+	seq := u.scanSeq
+	ctx, cancel := context.WithCancel(context.Background())
+	u.scanCancel = cancel
+	clear(u.gone)
+	pinned, t := u.pinned, u.opts.Target
 	go func() {
-		entries, err := u.listRoot()
-		fyne.Do(func() { u.applyEntries(seq, entries, err) })
+		defer cancel()
+		err := list(ctx, func(entries []scan.Entry, done bool) {
+			if t.Root != "" {
+				// Here rather than in applyEntries: it may stat the file.
+				entries = withPinned(entries, pinned, t.Root, t.Sort)
+			}
+			fyne.Do(func() { u.applyEntries(seq, entries, done, nil) })
+		})
+		if err != nil {
+			fyne.Do(func() { u.applyEntries(seq, nil, true, err) })
+		}
 	}()
 }
 
-// listRoot reads the listing root (u.opts.Dir must be set). It touches only
-// u.opts, so it runs on any goroutine.
-func (u *viewer) listRoot() ([]scan.Entry, error) {
-	if u.opts.Recursive {
-		return scan.ListTree(u.opts.Dir, u.opts.Sort)
-	}
-	return scan.List(u.opts.Dir, u.opts.Sort)
-}
-
-// applyEntries installs a fresh listing from rescan number seq, keeping the
-// current file selected by path and invalidating cached decodes of files
-// that changed. Listings finishing after a newer one are dropped.
-func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
-	if u.quitting || seq <= u.scanApplied {
+// applyEntries installs a snapshot of scan number seq (done: its last),
+// keeping the current file selected by path and invalidating cached
+// decodes of files that changed. Snapshots of a scan that a newer one
+// replaced are dropped. Until done, files of the current playlist that the
+// scan has not reached yet stay (see mergeListing); removed files go with
+// the last snapshot.
+func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, done bool, err error) {
+	if u.quitting || seq < u.scanSeq {
 		return
 	}
-	u.scanApplied = seq
+	u.scanning = !done
 	if err != nil {
 		u.flashMsg("rescan: " + err.Error())
+		if len(u.entries) == 0 {
+			u.showNone()
+		}
 		return
 	}
-	if u.opts.Dir != "" {
-		entries = withPinned(entries, u.pinned, u.opts.Dir, u.opts.Sort)
+	if len(u.gone) > 0 {
+		entries = slices.DeleteFunc(entries, func(e scan.Entry) bool { return u.gone[e.Path] })
+	}
+	if !done {
+		entries = mergeListing(u.entries, entries, u.opts.Target.Sort)
 	}
 	curPath := ""
 	if u.idx >= 0 && u.idx < len(u.entries) {
@@ -627,7 +702,13 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 	}
 	u.entries = entries
 	u.recountMarks()
-	u.list.UnselectAll()
+	// Reselect (which scrolls the sidebar) only when the current entry
+	// moved, so the sidebar can be scrolled while a scan fills it in.
+	rebuilt := u.useTwoLines()
+	moved := reload || newIdx != u.idx || rebuilt
+	if moved {
+		u.list.UnselectAll()
+	}
 	u.list.Refresh()
 
 	if len(entries) == 0 {
@@ -638,12 +719,39 @@ func (u *viewer) applyEntries(seq uint64, entries []scan.Entry, err error) {
 		u.show(newIdx)
 		return
 	}
-	u.idx = newIdx
-	u.syncList()
+	if moved {
+		u.idx = newIdx
+		u.syncList()
+	}
 	u.updateStatus()
 }
 
-// showNone is the empty-playlist state.
+// mergeListing is a partial listing (sorted) with the entries of the
+// current playlist (sorted the same way) that it does not have yet, in
+// order. While a rescan runs, files it has not reached keep their place
+// instead of vanishing and coming back.
+func mergeListing(cur, partial []scan.Entry, sort scan.Sort) []scan.Entry {
+	in := make(map[string]bool, len(partial))
+	for _, e := range partial {
+		in[e.Path] = true
+	}
+	out := make([]scan.Entry, 0, len(cur)+len(partial))
+	i := 0
+	for _, e := range cur {
+		if in[e.Path] {
+			continue
+		}
+		for i < len(partial) && scan.Compare(partial[i], e, sort) < 0 {
+			out = append(out, partial[i])
+			i++
+		}
+		out = append(out, e)
+	}
+	return append(out, partial[i:]...)
+}
+
+// showNone is the empty-playlist state: "no images", or "scanning…" while
+// a scan may still find some.
 func (u *viewer) showNone() {
 	u.clearPending()
 	u.idx = 0
@@ -651,7 +759,11 @@ func (u *viewer) showNone() {
 	u.loading, u.loadSlow = false, false
 	u.loadErr = nil
 	u.win.SetTitle("pix")
-	u.vp.SetMessage("no images")
+	if u.scanning {
+		u.vp.SetMessage("scanning…")
+	} else {
+		u.vp.SetMessage("no images")
+	}
 	u.updateStatus()
 }
 
@@ -723,10 +835,11 @@ func (u *viewer) applyStatusBar() {
 
 func (u *viewer) updateStatus() {
 	s := statusInfo{
-		Empty:   len(u.entries) == 0,
-		Locked:  u.vp.view.Locked,
-		NMarked: u.nMarked,
-		Flash:   u.flash,
+		Empty:    len(u.entries) == 0,
+		Scanning: u.scanning,
+		Locked:   u.vp.view.Locked,
+		NMarked:  u.nMarked,
+		Flash:    u.flash,
 	}
 	if !s.Empty {
 		e := u.entries[u.idx]

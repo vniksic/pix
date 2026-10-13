@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2/test"
+
+	"pix/internal/imgload"
 	"pix/internal/scan"
 )
 
@@ -190,5 +193,86 @@ func TestFinishCopiesAndPrintsMarked(t *testing.T) {
 	u = &viewer{opts: Options{Stdout: &stdout}, marks: map[string]bool{}, copied: map[string]bool{}, final: paths}
 	if err := u.finish(); err != nil || stdout.Len() != 0 {
 		t.Errorf("unmarked: err %v, stdout %q", err, stdout.String())
+	}
+}
+
+// Snapshots of the scan in progress all apply; those of a scan a newer one
+// replaced are dropped; until a scan is done, entries it has not reached
+// stay; its last snapshot drops the files that are gone.
+func TestApplyEntriesSnapshots(t *testing.T) {
+	a := test.NewTempApp(t)
+	ent := func(name string) scan.Entry {
+		return scan.Entry{Path: "/pics/" + name, Name: name, Label: name}
+	}
+	b := ent("b.png")
+	u := &viewer{
+		opts:     Options{Target: scan.Target{Root: "/pics"}},
+		app:      a,
+		win:      a.NewWindow("pix"),
+		loader:   imgload.NewLoader(2, 1),
+		entries:  []scan.Entry{b}, // the pinned file, already shown
+		marks:    map[string]bool{},
+		copied:   map[string]bool{},
+		trashing: map[string]bool{},
+		rots:     map[string]int{},
+		gone:     map[string]bool{},
+		scanning: true,
+		scanSeq:  1,
+	}
+	u.build()
+	paths := func() (out []string) {
+		for _, e := range u.entries {
+			out = append(out, e.Name)
+		}
+		return out
+	}
+	check := func(step string, want []string, scanning bool) {
+		t.Helper()
+		if got := paths(); !slices.Equal(got, want) {
+			t.Errorf("%s: playlist %q, want %q", step, got, want)
+		}
+		if u.scanning != scanning || strings.Contains(u.status.Text, "scanning…") != scanning {
+			t.Errorf("%s: scanning %v, status %q", step, u.scanning, u.status.Text)
+		}
+		if len(u.entries) > 0 && u.entries[u.idx].Path != b.Path {
+			t.Errorf("%s: current is %s, want b.png", step, u.entries[u.idx].Name)
+		}
+	}
+
+	u.applyEntries(1, []scan.Entry{ent("a.png"), b}, false, nil)
+	check("first snapshot", []string{"a.png", "b.png"}, true)
+	u.applyEntries(1, []scan.Entry{ent("a.png"), b, ent("c.png"), ent("d.png")}, false, nil)
+	check("same scan, later snapshot", []string{"a.png", "b.png", "c.png", "d.png"}, true)
+
+	u.scanSeq = 2 // a rescan replaced scan 1
+	u.applyEntries(1, []scan.Entry{ent("a.png"), b, ent("c.png"), ent("d.png"), ent("e.png")}, true, nil)
+	check("older scan dropped", []string{"a.png", "b.png", "c.png", "d.png"}, true)
+	u.applyEntries(2, []scan.Entry{b, ent("e.png")}, false, nil)
+	check("rescan in progress keeps unreached", []string{"a.png", "b.png", "c.png", "d.png", "e.png"}, true)
+	u.applyEntries(2, []scan.Entry{b, ent("c.png"), ent("e.png")}, true, nil)
+	check("rescan done", []string{"b.png", "c.png", "e.png"}, false)
+	if !strings.HasPrefix(u.status.Text, "b.png   1/3") {
+		t.Errorf("status %q", u.status.Text)
+	}
+
+	u.scanSeq = 3
+	u.scanning = true
+	u.applyEntries(3, nil, true, nil)
+	check("empty", nil, false)
+	if u.vp.msg.Text != "no images" || !strings.HasPrefix(u.status.Text, "no images") {
+		t.Errorf("empty: message %q, status %q", u.vp.msg.Text, u.status.Text)
+	}
+}
+
+func TestMergeListing(t *testing.T) {
+	ent := func(name string) scan.Entry { return scan.Entry{Path: "/p/" + name, Name: name, Label: name} }
+	cur := []scan.Entry{ent("a"), ent("c"), ent("e")}
+	partial := []scan.Entry{ent("b"), ent("c"), ent("f")}
+	var got []string
+	for _, e := range mergeListing(cur, partial, scan.SortName) {
+		got = append(got, e.Name)
+	}
+	if want := []string{"a", "b", "c", "e", "f"}; !slices.Equal(got, want) {
+		t.Errorf("merged %q, want %q", got, want)
 	}
 }

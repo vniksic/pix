@@ -18,6 +18,8 @@ binary, no config file, meant to be launched from a terminal.
 Files are detected by content, not extension, so PDFs, videos and misnamed
 files never show up in the list. Formats: JPEG (with EXIF orientation), PNG,
 GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
+Big or slow (network) directories open immediately and the list fills in
+while they are read.
 
 ## Keys
 
