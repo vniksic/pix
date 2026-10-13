@@ -108,8 +108,8 @@ A single dash works too (`-all`).
 Prebuilt Linux x86-64 binaries are on the
 [releases page](https://github.com/vniksic/pix/releases). Unpack and run:
 
-    tar xzf pix-*-linux-amd64.tar.gz
-    ./pix ~/Pictures
+    tar xzf pix-*-linux-amd64.tar.gz    # unpacks into pix/
+    pix/pix ~/Pictures
 
 It needs only what every Linux desktop already has: libc, libGL,
 libwayland-client, libX11 and libffi. For clipboard copy install

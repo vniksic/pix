@@ -30,7 +30,8 @@ jobs:
           go build -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o pix .
           ./pix -version
           mkdir -p dist
-          tar -C . -czf "dist/pix-${GITHUB_REF_NAME}-linux-amd64.tar.gz" pix README.md LICENSE
+          # The archive unpacks into a pix/ directory.
+          tar -czf "dist/pix-${GITHUB_REF_NAME}-linux-amd64.tar.gz" --transform 's,^,pix/,' pix README.md LICENSE
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
       - name: Release
         uses: softprops/action-gh-release@v2
