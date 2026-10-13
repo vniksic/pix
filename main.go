@@ -13,17 +13,32 @@ import (
 
 var version = "dev" // set at build time: -ldflags "-X main.version=v0.1.0"
 
+// usage is flag.PrintDefaults with the flags spelled --name; the flag
+// package accepts both spellings.
+func usage() {
+	w := flag.CommandLine.Output()
+	fmt.Fprintf(w, "usage: pix [flags] [path ...]\n       pix [flags] -     (read paths from stdin)\n")
+	flag.VisitAll(func(f *flag.Flag) {
+		name, usage := flag.UnquoteUsage(f)
+		s := "  --" + f.Name
+		if name != "" {
+			s += " " + name
+		}
+		if f.DefValue != "" && f.DefValue != "false" {
+			usage += " (default " + f.DefValue + ")"
+		}
+		fmt.Fprintf(w, "%-20s %s\n", s, usage)
+	})
+}
+
 func main() {
-	sortFlag := flag.String("sort", "name", "sort order: name|mtime|date (date taken, else mtime)")
+	sortFlag := flag.String("sort", "name", "sort `ORDER`: name|mtime|date (date taken, else mtime)")
 	outDir := flag.String("out", "", "copy marked files (m) into `DIR` on Enter and on quit")
 	all := flag.Bool("all", false, "include subdirectories, recursively")
 	fullscreen := flag.Bool("fullscreen", false, "start fullscreen")
 	sidebar := flag.Bool("sidebar", true, "start with the sidebar visible")
 	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: pix [flags] [path ...]\n       pix [flags] -     (read paths from stdin)\n")
-		flag.PrintDefaults()
-	}
+	flag.Usage = usage
 	flag.Parse()
 
 	if *showVersion {

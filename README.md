@@ -12,8 +12,8 @@ binary, no config file, meant to be launched from a terminal.
     pix a.jpg b.jpg somedir # these files, then somedir's images
     pix --all a.jpg somedir # same, with somedir's subdirectories too
     find . -name '*.jpg' | pix -        # view the paths read from stdin
-    pix -sort date ~/DCIM   # in the order the pictures were taken
-    pix --all -out ../keep  # cull: mark keepers with m, they are copied to ../keep
+    pix --sort date ~/DCIM   # in the order the pictures were taken
+    pix --all --out ../keep  # cull: mark keepers with m, they are copied to ../keep
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
 files never show up in the list. Formats: JPEG (with EXIF orientation), PNG,
@@ -71,9 +71,9 @@ When pix quits (q, Escape, or closing the window) any marked images not
 copied yet are copied too, then the marked paths are printed to stdout, one
 per line, in list order, so they can be piped:
 
-    pix --all -out ../keep              # copy the keepers
+    pix --all --out ../keep             # copy the keepers
     pix . | xargs -d '\n' -r gimp       # open the marked ones in GIMP
-    pix -sort date . > picks.txt        # just remember them
+    pix --sort date . > picks.txt       # just remember them
 
 Nothing else is ever written to stdout. `Delete`, pressed twice, moves the
 current file to the desktop trash (restorable from the file manager).
@@ -83,15 +83,17 @@ current file to the desktop trash (restorable from the file manager).
 Flags go before the paths (`pix --all dir`, not `pix dir --all`). A single
 `-` as the path reads the list of paths from stdin, one per line.
 
-    -all               include subdirectories, recursively (also --all)
-    -sort name|mtime|date
-                       sort order (default name, natural order: img2 < img10;
-                       mtime and date sort the whole tree with --all; date is
-                       the EXIF date taken, files without one use mtime)
-    -out DIR           where Enter (and quitting) copies the marked images
-    -fullscreen        start fullscreen
-    -sidebar=false     start with the file list hidden
-    -version
+    --all               include subdirectories, recursively
+    --sort name|mtime|date
+                        sort order (default name, natural order: img2 < img10;
+                        mtime and date sort the whole tree with --all; date is
+                        the EXIF date taken, files without one use mtime)
+    --out DIR           where Enter (and quitting) copies the marked images
+    --fullscreen        start fullscreen
+    --sidebar=false     start with the file list hidden
+    --version
+
+A single dash works too (`-all`).
 
 ## Download
 
