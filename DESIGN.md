@@ -11,7 +11,7 @@ Module name: `pix`. Binary: `pix`. Go 1.26 (go.mod already set up, deps fetched)
     main.go                 flags, wiring, exit codes
     internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, dir watch
     internal/imgload/       decoding (all formats), EXIF orientation and date taken, async LRU cache
-    internal/fileops/       copying marked files out, freedesktop trash, opening in another program
+    internal/fileops/       copying marked files out, freedesktop trash, permanent delete, opening in another program
     internal/clipboard/     image/text copy via wl-copy (Wayland) or xclip (X11)
     internal/hypr/          Hyprland control-socket client (fullscreen on the current monitor)
     internal/ui/            Fyne app: window, viewport widget, sidebar, status bar, keys
@@ -269,6 +269,12 @@ func RotateOrientation(o, q int) int
 // The file is never removed unless the move succeeded. Pure Go, no gio.
 func Trash(path string) error
 
+// Delete removes path for good (os.Remove, no trash): the only place pix
+// deletes a file outright. Lstat first; anything but a regular file or a
+// symlink (removed as the link only, never its target, as Trash and rm
+// do) is refused and left alone. A missing path is an error.
+func Delete(path string) error
+
 // OpenExternal starts $PIX_OPEN (a program name, argument = path) or
 // xdg-open with the path, detached (Setsid), stdio on /dev/null.
 func OpenExternal(path string) error
@@ -335,8 +341,8 @@ goroutine via fyne.Do. Scan goroutines never touch viewer state.
 - Until a scan's last snapshot, the entries of the current playlist that
   it has not reached yet keep their place (mergeListing), so a rescan on a
   slow mount never empties the list; files that are gone leave with the
-  last snapshot. Files trashed while a scan runs are filtered out of its
-  snapshots.
+  last snapshot. Files trashed or deleted while a scan runs are filtered
+  out of its snapshots.
 - The pinned file is added to every listing snapshot by withPinned on the
   scan goroutine (it may stat the file).
 - While the scan of the startup (or a rescan that has delivered a partial
@@ -352,7 +358,7 @@ goroutine via fyne.Do. Scan goroutines never touch viewer state.
 - Quitting cancels the scan and does not wait for it; the marked-path
   output and the exit copy use the playlist as it is at close.
 
-Window: HBox( sidebar | VBox( viewport, status ) ). Sidebar fixed width ~280pt,
+Window: HBox( sidebar | VBox( Stack( viewport, help ), status ) ). Sidebar fixed width ~280pt,
 hidden in fullscreen and when toggled off. Window title = the entry's Label.
 Background: near-black (#111) behind the image.
 
@@ -409,7 +415,7 @@ the pure rotationFor: the remembered value for its path, else the rotation
 the lock carried over (when locked), else 0; it is applied with
 View.SetRot, which goes through Rotate (Fit re-fits). The lock still keeps
 mode, scale and pan. The map survives rescans and `--all` lists; a trashed
-file's entry is dropped, a renamed file simply starts afresh. Ctrl+C copies
+or deleted file's entry is dropped, a renamed file simply starts afresh. Ctrl+C copies
 the displayed rotation, so it includes the remembered one.
 
 ### Keys (global, via Canvas().SetOnTypedKey / SetOnTypedRune / AddShortcut)
@@ -430,14 +436,43 @@ the displayed rotation, so it includes the remembered one.
     m                             mark / unmark the current image
     Enter                         copy marked files not yet copied to -out (in a goroutine)
     Delete                        first press asks; a second press within 1.5s moves the file to the trash
+    Shift+Delete                  delete the file permanently, after a confirmation dialog (Enter deletes, Escape cancels)
     l                             lock / unlock the view across image changes
     o                             open the file in another program ($PIX_OPEN or xdg-open)
+    ?, F1                         show the help (the key list); any key closes it
     Escape                        leave fullscreen if in it, else quit
     q                             quit
 
 Mouse: wheel = zoom around cursor (×1.1 per notch; GLFW reports 1.5 per
 notch on Wayland vs 1 on X11, so deltas are divided by 1.5 on Wayland); left-drag = pan;
 Shift+left-drag = fast pan; double-click = toggle Fit/1:1.
+
+### Help
+
+`?` (a rune, so whatever layout produces it) or F1 shows the key list as
+an overlay over the viewport only: a dark translucent rectangle with the
+text centred on it in the monospace font, light on dark. The sidebar and
+the status bar stay as they are, and the image underneath is left alone
+(no reload, no view change); hiding the overlay reveals it unchanged. Too
+short a viewport shows the list from the top, cut off (lines that do not
+fit are not drawn); there is no scrolling. The overlay is not focusable
+(the viewport keeps the keyboard) and its MinSize is zero (it never grows
+the window's minimum size).
+
+Any key press closes it (modifiers alone excepted) and is then handled as
+usual, so `?` then PageDown pages and `f` toggles fullscreen. `?`, F1 and
+Escape only close it: Escape then neither leaves fullscreen nor quits. The
+decision is made in keyDown (helpPress), which every physical press reaches
+before its typedKey, shortcut and typedRune; it records that the press
+closed the help (helpClosed) for the ?, F1 and Escape handlers, including
+that key's auto-repeat. A mouse button pressed on the overlay closes it;
+the wheel over it does nothing.
+
+The text is the pure function helpText(): the keys in two aligned
+columns (keys wrapped at 18 characters, actions at 40, no line over 60),
+grouped with blank lines (navigation; view; marks and files; copying; the
+list; help and quit). README.md's key table
+is the source of truth; a test checks that both name the same keys.
 
 ### Fullscreen
 
@@ -504,7 +539,7 @@ message (2s). Show `error: <msg>` in place of dims if decode failed (the
 viewport shows a plain message too; paging must still work past broken
 files). It is composed by the pure function statusText (tested headless).
 
-### Marks, copying out, trash
+### Marks, copying out, trash, delete
 
 - `m` toggles a mark on the current file (a set keyed by path; marks of
   files that leave the listing are kept and count again if they return).
@@ -526,7 +561,7 @@ files). It is composed by the pure function statusText (tested headless).
 - Quitting (q, Escape, closing the window): the window's OnClosed handler
   (main goroutine, every quit path) snapshots the playlist order and sets
   `quitting`, after which callbacks leave the state alone. Once
-  ShowAndRun returns, Run waits for clipboard, copy-out and trash
+  ShowAndRun returns, Run waits for clipboard, copy-out and trash or delete
   goroutines, then, if `-out` is set, synchronously copies the marked files
   not yet copied (one summary line on stderr; a failure exits 1), and
   finally prints every marked path, absolute, one per line, in playlist
@@ -534,14 +569,55 @@ files). It is composed by the pure function statusText (tested headless).
 - Nothing else writes to stdout: main moves the real stdout to a
   close-on-exec descriptor for that list and points fd 1 at stderr, so
   Fyne, GL drivers, C decoders and child processes cannot pollute a pipe.
-- `Delete` (KeyDown, so auto-repeat never counts as a second press) flashes
-  `Delete again to trash <name>`; a second press on the same file within
-  1.5s runs fileops.Trash in a goroutine. On success the entry leaves the
-  playlist and the marks, its decode is invalidated, the next image is
-  shown (the previous if it was the last; "no images" if none) and
-  `trashed <name>` flashes. On error the error is flashed and the entry
-  stays. Any other key (modifiers alone excepted) cancels the pending
+- `Delete` flashes `Delete again to trash <name>`; a second press on the
+  same file within 1.5s runs fileops.Trash in a goroutine. On success the
+  entry leaves the playlist and the marks, its decode is invalidated, the
+  next image is shown (the previous if it was the last; "no images" if
+  none) and `trashed <name>` flashes. On error the error is flashed and the
+  entry stays. Any other key (modifiers alone excepted) cancels the pending
   Delete.
+- Only physical presses count, and Shift+Delete never counts as one. The
+  GLFW driver calls KeyDown for every press first (no modifier bits in the
+  event); then, with Shift, it turns Delete into `fyne.ShortcutCut{Secondary:
+  true}` for TypedShortcut and skips TypedKey, while a plain Delete goes to
+  TypedKey; auto-repeat goes to TypedKey (or TypedShortcut) without a
+  KeyDown. So keyDown(Delete) only sets `delDown`, typedKey(Delete) runs
+  the two-press logic only if `delDown` is set (and clears it), and every
+  shortcut clears it. A prompt followed by Shift+Delete therefore opens the
+  dialog instead of trashing, and holding Delete never trashes.
+- `Shift+Delete` (typedShortcut: a `*fyne.ShortcutCut` with Secondary; Ctrl+X
+  is a Cut without it and does nothing) drops a pending Delete prompt and
+  opens a modal confirmation over the window: title `Delete permanently?`,
+  the file's Label, `will be deleted for good. It will not go to the
+  trash.`, buttons Cancel and Delete (danger colour). It is not opened with
+  an empty playlist, for a file being trashed or deleted, or when one is
+  open. It is fyne's confirm dialog rebuilt from widget.NewModalPopUp
+  (confirm.go): importing fyne's dialog package would pull in a module
+  (FyshOS/fancyfs) that pix does not otherwise need. The ShortcutCut is
+  also registered on the canvas, for when nothing is focused.
+- While the dialog is open (`u.confirm` non-nil) the key handlers (typedKey,
+  typedRune, keyDown, typedShortcut) check it first, before the help and
+  the Delete prompt: Enter/Return confirms, Escape cancels, every other key,
+  rune and shortcut is ignored, so nothing pages, quits or leaves
+  fullscreen behind it. The auto-repeat of the Enter or Escape that closed
+  it is ignored too (`confirmClosed`, cleared by the next KeyDown), so
+  holding Escape does not go on to quit. The popup's overlay has its own
+  focus manager with nothing focused, so keys arrive through the canvas
+  fallbacks (SetOnKeyDown, SetOnTypedKey, SetOnTypedRune, the canvas
+  shortcuts), which call the same handlers. focusViewport does nothing
+  while it is open (the viewport keeps its focus in the content underneath,
+  and onFocusOff must not fight the overlay); Tab, which Fyne uses to move
+  focus onto a dialog button (where Enter and Escape would no longer reach
+  the viewer), is followed by an Unfocus of the overlay. Mouse clicks on the
+  buttons work as usual. Cancel, Escape (Hide) and Delete, Enter (Confirm)
+  all close the popup and then run one callback (false / true), which clears
+  `u.confirm` and refocuses the viewport.
+- Confirming deletes the file the dialog named (even if a rescan moved the
+  playlist meanwhile) with fileops.Delete in a goroutine, through the same
+  path as the trash (remove/removed): `trashing` marks the path in flight
+  for both, so the two cannot race on one file; on success marks and the
+  copied flag go, the entry leaves the playlist as above and `deleted
+  <name>` flashes; on error the error is flashed and the entry stays.
 - `o` runs fileops.OpenExternal on the current file in a goroutine and
   flashes an error, if any.
 
@@ -567,7 +643,8 @@ rendered, is not taken but kept as the one pending step (not a queue; the
 newest direction wins). When the image renders (or its error message does)
 the pending step runs after whatever is left of the dwell. A single press on
 an image already shown is immediate. Home/End, sidebar clicks, quitting,
-trashing the current file and rescans that remove it drop the pending step.
+trashing or deleting the current file and rescans that remove it drop the
+pending step.
 The load loop still coalesces requests as a safety net. The decision is the
 pure gateStep.
 

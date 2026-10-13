@@ -70,6 +70,7 @@ type viewer struct {
 	idx     int
 
 	vp      *viewport
+	help    *helpOverlay // the key list over the viewport (? and F1)
 	list    *sideList
 	sidebar *fyne.Container
 	root    *fyne.Container
@@ -80,6 +81,7 @@ type viewer struct {
 	fsSidebar  bool // sidebar shown while fullscreen (reset on entering)
 	fullscreen bool
 	statusOff  bool // status bar hidden by an explicit 1:1 in fullscreen; cleared by Fit and by (un)fullscreening
+	helpClosed bool // the key press in progress closed the help (see helpPress)
 	loadToken  uint64
 	loading    bool
 	loadSlow   bool // loading has taken longer than loadingDelay
@@ -104,8 +106,8 @@ type viewer struct {
 	scanSeq    uint64
 	scanCancel context.CancelFunc
 	scanning   bool // the playlist is still being filled in
-	// gone holds the files trashed since the latest scan started: it may
-	// have listed them before they went.
+	// gone holds the files trashed or deleted since the latest scan
+	// started: it may have listed them before they went.
 	gone map[string]bool
 	// pinned is the file named on the command line: kept in the playlist
 	// while it exists even if List would leave it out (hidden, unsniffable).
@@ -121,14 +123,14 @@ type viewer struct {
 	copyPending *copyJob
 	copyBusy    bool
 
-	// Marks. markMu guards marks and copied: the copy-out and trash
+	// Marks. markMu guards marks and copied: the copy-out, trash and delete
 	// goroutines update them, and Run reads them after the event loop.
 	markMu  sync.Mutex
 	marks   map[string]bool // marked paths
 	copied  map[string]bool // marked paths already copied to OutDir
 	nMarked int             // marked entries in the playlist
 	outBusy bool            // a copy to OutDir is running
-	// bg counts copy-out and trash goroutines; Run waits for them.
+	// bg counts copy-out, trash and delete goroutines; Run waits for them.
 	bg sync.WaitGroup
 	// final is the playlist (paths, in order) when the window closed, for
 	// the exit copy and the list printed to stdout; finalRots the rotations
@@ -139,15 +141,24 @@ type viewer struct {
 	errOut io.Writer
 
 	// Pending Delete: a second press on the same file within deleteWindow
-	// trashes it. trashing holds paths being trashed.
+	// trashes it. trashing holds paths being trashed or deleted. delDown
+	// says a physical Delete press is under way: keyDown saw it and its
+	// typedKey has not come yet (see keyDown).
 	delPath   string
 	delAt     time.Time
 	delPrompt string
+	delDown   bool
 	trashing  map[string]bool
+	// confirm is the Shift+Delete dialog while it is open (nil otherwise).
+	// The key handlers then only feed it (see confirmKey). confirmClosed:
+	// the key press in progress closed it, so its auto-repeat is ignored.
+	confirm       *confirmBox
+	confirmClosed bool
 
 	// rots remembers, for this session only, the rotation the user chose
 	// with [ / ] for each photo, by absolute path (see rotationFor). Never
-	// reset by rescans; an entry is dropped when its file is trashed.
+	// reset by rescans; an entry is dropped when its file is trashed or
+	// deleted.
 	rots map[string]int
 
 	reqMu      sync.Mutex // guards reqPending and reqBusy (shared with the load goroutine)
@@ -327,8 +338,15 @@ func (u *viewer) build() {
 	u.status.SizeName = theme.SizeNameCaptionText
 	u.status.Truncation = fyne.TextTruncateEllipsis
 
+	u.help = newHelpOverlay(helpText())
+	u.help.onDown = func() {
+		u.setHelp(false)
+		u.focusViewport()
+	}
+
 	u.sidebar = container.New(fixedWidth(sidebarWidth), u.list)
-	u.right = container.NewBorder(nil, u.status, nil, nil, u.vp)
+	// The help lies over the viewport only, so the status bar stays visible.
+	u.right = container.NewBorder(nil, u.status, nil, nil, container.NewStack(u.vp, u.help))
 	u.root = container.NewBorder(nil, nil, u.sidebar, nil, u.right)
 	u.win.SetContent(u.root)
 	u.applySidebar()
@@ -343,6 +361,9 @@ func (u *viewer) build() {
 	// Ctrl+C arrives as fyne.ShortcutCopy from the GLFW driver; register the
 	// desktop.CustomShortcut form too in case another driver reports that.
 	c.AddShortcut(&fyne.ShortcutCopy{}, u.typedShortcut)
+	// Shift+Delete arrives as fyne.ShortcutCut{Secondary: true}. Shortcuts
+	// match by name, so Ctrl+X comes here too; typedShortcut tells them apart.
+	c.AddShortcut(&fyne.ShortcutCut{}, u.typedShortcut)
 	c.AddShortcut(shortcutCtrlC, u.typedShortcut)
 	c.AddShortcut(shortcutCopyPath, u.typedShortcut)
 	u.focusViewport()
@@ -362,6 +383,7 @@ func (u *viewer) newList() *sideList {
 	l.onRune = u.typedRune
 	l.onShortcut = u.typedShortcut
 	l.OnSelected = func(id int) {
+		u.setHelp(false) // a click in the list means: back to the pictures
 		if id != u.idx {
 			u.jump(id)
 		}
@@ -385,8 +407,28 @@ func (u *viewer) useTwoLines() bool {
 	return true
 }
 
+// setHelp shows or hides the key list. Fyne registers an object with a
+// canvas only when the painter walks it, and it never walks a hidden one:
+// the overlay starts hidden, so Show alone refreshes into the void and the
+// window is not repainted until something else is (the mouse entering the
+// viewport, say). Asking the window's canvas directly repaints now. The
+// headless test driver repaints on every capture, so it cannot tell.
+func (u *viewer) setHelp(show bool) {
+	if show == u.help.Visible() {
+		return
+	}
+	if show {
+		u.help.Show()
+	} else {
+		u.help.Hide()
+	}
+	u.win.Canvas().Refresh(u.help)
+}
+
 func (u *viewer) focusViewport() {
-	if u.quitting {
+	// Not while the dialog is open: its overlay owns focus then, and keys
+	// reach us through the canvas fallbacks anyway. Its callback refocuses.
+	if u.quitting || u.confirm != nil {
 		return
 	}
 	if c := u.win.Canvas(); c.Focused() != fyne.Focusable(u.vp) {
@@ -989,10 +1031,24 @@ func (u *viewer) quit() {
 // ---- keys ----
 
 func (u *viewer) typedKey(e *fyne.KeyEvent) {
+	if u.confirm != nil {
+		u.confirmKey(e.Name)
+		return
+	}
+	if u.confirmClosed {
+		return // auto-repeat of the Enter or Escape that closed the dialog
+	}
 	if e.Name != fyne.KeyDelete && !isModifierKey(e.Name) {
 		u.cancelDelete()
 	}
 	switch e.Name {
+	case fyne.KeyDelete:
+		// Only once per physical press: auto-repeat comes without a
+		// keyDown, so holding Delete never counts as pressing it twice.
+		if u.delDown {
+			u.delDown = false
+			u.deleteKey()
+		}
 	case fyne.KeyPageDown, fyne.KeySpace, fyne.KeyRight, fyne.KeyDown:
 		u.step(1)
 	case fyne.KeyPageUp, fyne.KeyBackspace, fyne.KeyLeft, fyne.KeyUp:
@@ -1005,7 +1061,14 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 		u.toggleSidebar()
 	case fyne.KeyReturn, fyne.KeyEnter:
 		u.copyMarked()
+	case fyne.KeyF1:
+		if !u.helpClosed {
+			u.setHelp(true)
+		}
 	case fyne.KeyEscape:
+		if u.helpClosed {
+			break // this press closed the help; that is all Escape does then
+		}
 		if u.fullscreen {
 			u.setFullscreen(false)
 		} else {
@@ -1015,6 +1078,9 @@ func (u *viewer) typedKey(e *fyne.KeyEvent) {
 }
 
 func (u *viewer) typedRune(r rune) {
+	if u.confirm != nil {
+		return
+	}
 	u.cancelDelete()
 	v := &u.vp.view
 	switch unicode.ToLower(r) {
@@ -1056,6 +1122,10 @@ func (u *viewer) typedRune(r rune) {
 		u.updateStatus()
 	case 'o':
 		u.openExternal()
+	case '?':
+		if !u.helpClosed {
+			u.setHelp(true)
+		}
 	case 'q':
 		u.quit()
 	}
@@ -1070,7 +1140,19 @@ func (u *viewer) rememberRot() {
 }
 
 func (u *viewer) typedShortcut(s fyne.Shortcut) {
+	if u.confirm != nil {
+		return
+	}
+	u.delDown = false // a Delete with a modifier is not a plain Delete press
 	u.cancelDelete()
+	if c, ok := s.(*fyne.ShortcutCut); ok {
+		// Shift+Delete; Ctrl+X is a Cut too, but not Secondary, and does
+		// nothing.
+		if c.Secondary {
+			u.confirmDelete()
+		}
+		return
+	}
 	switch s.ShortcutName() {
 	case (&fyne.ShortcutCopy{}).ShortcutName(), shortcutCtrlC.ShortcutName():
 		u.copyImage()

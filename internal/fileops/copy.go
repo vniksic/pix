@@ -1,4 +1,4 @@
-// Package fileops copies, trashes and externally opens image files.
+// Package fileops copies, trashes, deletes and externally opens image files.
 package fileops
 
 import (

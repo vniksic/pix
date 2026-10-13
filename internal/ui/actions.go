@@ -151,10 +151,32 @@ func isModifierKey(k fyne.KeyName) bool {
 }
 
 // keyDown sees each physical key press once (auto-repeat goes only to
-// typedKey), so holding Delete never counts as pressing it twice.
+// typedKey). It comes before the press's typedKey, typedShortcut and
+// typedRune.
+//
+// A Delete press only sets delDown here; its typedKey runs deleteKey. The
+// event carries no modifiers, and with Shift the driver sends the press to
+// typedShortcut (as a secondary Cut) instead of typedKey, so only there is
+// a plain Delete told apart from Shift+Delete. Auto-repeat reaches typedKey
+// without coming here, so it never counts as a second press.
 func (u *viewer) keyDown(e *fyne.KeyEvent) {
-	if e.Name == fyne.KeyDelete {
-		u.deleteKey()
+	if u.confirm != nil {
+		if e.Name == fyne.KeyTab {
+			// Fyne moves focus into the dialog on Tab, after this; a focused
+			// button would keep Enter and Escape from reaching us. Take the
+			// focus back once the press has been handled.
+			fyne.Do(func() {
+				if u.confirm != nil {
+					u.win.Canvas().Unfocus()
+				}
+			})
+		}
+		return
+	}
+	if !isModifierKey(e.Name) {
+		u.confirmClosed = false
+		u.helpPress()
+		u.delDown = e.Name == fyne.KeyDelete
 	}
 }
 
@@ -178,6 +200,20 @@ func (u *viewer) deleteKey() {
 	u.flashFor(u.delPrompt, deleteWindow) // gone when the second press would no longer count
 }
 
+// helpPress closes the help on any key press (modifiers alone excepted);
+// the key is then handled as usual. Every press passes through keyDown
+// before anything else sees it, so this is the one place that decides. ? and
+// F1 open the help and Escape leaves fullscreen or quits, but not on the
+// press that closed it: helpClosed tells their handlers, and stays set
+// through that key's auto-repeat, so holding Escape does not quit either.
+// The ? rune comes after its key, so closing cannot happen in typedRune.
+func (u *viewer) helpPress() {
+	u.helpClosed = u.help.Visible()
+	if u.helpClosed {
+		u.setHelp(false)
+	}
+}
+
 // cancelDelete forgets a pending Delete and its prompt.
 func (u *viewer) cancelDelete() {
 	if u.delPath == "" {
@@ -192,29 +228,78 @@ func (u *viewer) cancelDelete() {
 	u.delPrompt = ""
 }
 
-// trash moves e to the trash off the main goroutine, then drops it from the
-// playlist.
-func (u *viewer) trash(e scan.Entry) {
+// ---- permanent delete ----
+
+// confirmDelete opens the dialog that asks before deleting the current file
+// for good (Shift+Delete). Confirming deletes the file the dialog names,
+// even if the playlist changed meanwhile.
+func (u *viewer) confirmDelete() {
+	if len(u.entries) == 0 || u.confirm != nil {
+		return
+	}
+	e := u.entries[u.idx]
+	if u.trashing[e.Path] {
+		return
+	}
+	u.confirm = newConfirmBox("Delete permanently?", e.Label,
+		"will be deleted for good. It will not go to the trash.", "Delete",
+		func(ok bool) {
+			// Cancel and Escape (Hide) come here too, with ok false.
+			u.confirm = nil
+			if ok && !u.quitting {
+				u.deleteFile(e)
+			}
+			u.focusViewport()
+		}, u.win.Canvas())
+	u.confirm.Show()
+}
+
+// confirmKey handles a key while the dialog is open: Enter deletes, Escape
+// cancels, and nothing else does anything, so a key meant for the dialog
+// never pages, quits or leaves fullscreen behind it.
+func (u *viewer) confirmKey(k fyne.KeyName) {
+	switch k {
+	case fyne.KeyReturn, fyne.KeyEnter:
+		u.confirmClosed = true
+		u.confirm.Confirm()
+	case fyne.KeyEscape:
+		u.confirmClosed = true
+		u.confirm.Hide() // runs the callback with false
+	}
+}
+
+// trash moves e to the trash; deleteFile removes it for good.
+func (u *viewer) trash(e scan.Entry)      { u.remove(e, fileops.Trash, "trashed") }
+func (u *viewer) deleteFile(e scan.Entry) { u.remove(e, fileops.Delete, "deleted") }
+
+// remove runs op (fileops.Trash or fileops.Delete) on e off the main
+// goroutine, then drops it from the playlist (see removed). trashing keeps
+// a second operation off a file while one is in flight.
+func (u *viewer) remove(e scan.Entry, op func(string) error, done string) {
+	if u.trashing[e.Path] {
+		return
+	}
 	u.trashing[e.Path] = true
 	u.bg.Add(1)
 	go func() {
 		defer u.bg.Done()
-		err := fileops.Trash(e.Path)
+		err := op(e.Path)
 		if err == nil {
-			// Here rather than in trashed, which does not run once quitting:
+			// Here rather than in removed, which does not run once quitting:
 			// the exit report must not list a file that is gone.
 			u.markMu.Lock()
 			delete(u.marks, e.Path)
 			delete(u.copied, e.Path)
 			u.markMu.Unlock()
 		}
-		fyne.Do(func() { u.trashed(e, err) })
+		fyne.Do(func() { u.removed(e, err, done) })
 	}()
 }
 
-// trashed finishes a trash: on success the entry leaves the playlist and
-// the next image (or the previous, if it was the last) is shown.
-func (u *viewer) trashed(e scan.Entry, err error) {
+// removed finishes a trash or delete: on success the entry leaves the
+// playlist, the next image (or the previous, if it was the last) is shown
+// and "<done> <name>" flashes.
+func (u *viewer) removed(e scan.Entry, err error, done string) {
 	delete(u.trashing, e.Path)
 	if u.quitting {
 		return
@@ -238,7 +323,7 @@ func (u *viewer) trashed(e scan.Entry, err error) {
 		case len(u.entries) == 0:
 			u.showNone()
 		case i == u.idx:
-			u.jump(min(i, len(u.entries)-1)) // a pending step was relative to the trashed file
+			u.jump(min(i, len(u.entries)-1)) // a pending step was relative to the removed file
 		case i < u.idx:
 			u.idx--
 			u.syncList()
@@ -248,7 +333,7 @@ func (u *viewer) trashed(e scan.Entry, err error) {
 	} else {
 		u.recountMarks()
 	}
-	u.flashMsg("trashed " + e.Name)
+	u.flashMsg(done + " " + e.Name)
 }
 
 // ---- open ----

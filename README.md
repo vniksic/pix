@@ -38,10 +38,12 @@ while they are read.
 | Tab, b                           | toggle the file list                     |
 | r                                | rescan the directory                     |
 | m                                | mark / unmark the image (★)              |
-| Enter                            | copy the marked images to the `-out` directory |
+| Enter                            | copy the marked images to the `--out` directory |
 | Delete                           | press twice (within 1.5 s) to move the file to the trash |
+| Shift+Delete                     | delete the file permanently (asks first) |
 | l                                | lock the view: zoom, position and rotation stay when changing image |
 | o                                | open the file in another program (`$PIX_OPEN`, else `xdg-open`) |
+| ?, F1                            | show the keys (any key closes them)      |
 | Escape                           | leave fullscreen, or quit                |
 | q                                | quit                                     |
 
@@ -66,7 +68,7 @@ is locked and how many images are marked.
 ## Marking and culling
 
 `m` marks the current image (★ in the list and the status bar). With
-`-out DIR`, `Enter` copies the marked images there; files are never
+`--out DIR`, `Enter` copies the marked images there; files are never
 overwritten (an identical file already there is skipped, a different one
 with the same name gets `name-2.jpg`), and modification times are kept.
 The directory is created on the first copy; if the path is a file, or you
@@ -85,6 +87,8 @@ per line, in list order, so they can be piped:
 
 Nothing else is ever written to stdout. `Delete`, pressed twice, moves the
 current file to the desktop trash (restorable from the file manager).
+`Shift+Delete` deletes it permanently, after you confirm (`Enter` or the
+Delete button; `Escape` or Cancel keeps it).
 
 ## Flags
 
