@@ -2,6 +2,7 @@ package scan
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	"image/gif"
@@ -683,5 +684,53 @@ func TestWatchTreeCap(t *testing.T) {
 	}
 	if n := len(w.WatchList()); n != 2 { // root itself was not added to w here
 		t.Errorf("watcher has %d dirs, want 2", n)
+	}
+}
+
+// SortShuffle is a permutation of the name order, the same on every listing
+// within a run, and shuffles an ad-hoc list as a whole rather than per
+// argument.
+func TestShuffle(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	for i := range 20 {
+		write(t, filepath.Join(a, fmt.Sprintf("a%02d.png", i)), pngBytes(t))
+		write(t, filepath.Join(b, fmt.Sprintf("b%02d.png", i)), pngBytes(t))
+	}
+	byName, err := List(a, SortName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shuf, err := List(a, SortShuffle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Equal(names(shuf), names(byName)) {
+		t.Errorf("shuffled order is name order: %v", names(shuf))
+	}
+	sorted := slices.Clone(names(shuf))
+	slices.Sort(sorted)
+	if !slices.Equal(sorted, names(byName)) {
+		t.Errorf("shuffle is not a permutation: %v", names(shuf))
+	}
+	again, _ := List(a, SortShuffle)
+	if !slices.Equal(names(again), names(shuf)) {
+		t.Errorf("second listing differs:\n%v\n%v", names(again), names(shuf))
+	}
+
+	entries, _, _, err := Resolve([]string{a, b}, Options{Sort: SortShuffle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 40 {
+		t.Fatalf("got %d entries, want 40", len(entries))
+	}
+	// Per-argument groups would put all of a's files first.
+	firstB := slices.IndexFunc(entries, func(e Entry) bool { return e.Name[0] == 'b' })
+	interleaved := false
+	for _, e := range entries[firstB:] {
+		interleaved = interleaved || e.Name[0] == 'a'
+	}
+	if !interleaved {
+		t.Errorf("ad-hoc list shuffled per argument: %v", names(entries))
 	}
 }

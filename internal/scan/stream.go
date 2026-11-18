@@ -83,11 +83,16 @@ func scanRoot(ctx context.Context, root, file string, sort Sort, recursive bool,
 
 // scanAdhoc lists t.Paths in order: each path is a group of its own, a
 // directory expanded and sorted within its group, and a path already met
-// is skipped.
+// is skipped. SortShuffle puts everything in one group, shuffled together.
 func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 	cwd, _ := os.Getwd()
 	home, _ := os.UserHomeDir()
-	s := newScanner(t.Sort, len(t.Paths))
+	groupOf := func(i int) int { return i }
+	groups := len(t.Paths)
+	if t.Sort == SortShuffle {
+		groupOf, groups = func(int) int { return 0 }, 1
+	}
+	s := newScanner(t.Sort, groups)
 	// Sorted with the labels of each directory's own listing, as List
 	// gives them; relabelled for the snapshot.
 	s.relabel = func(path string) string { return adhocLabel(path, cwd, home) }
@@ -112,11 +117,11 @@ func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 			case fi == nil: // missing
 			case fi.IsDir():
 				des, err := os.ReadDir(path)
-				if err == nil && !(lister{ctx: ctx, send: once, group: i, recursive: t.Recursive}).dir(path, "", des) {
+				if err == nil && !(lister{ctx: ctx, send: once, group: groupOf(i), recursive: t.Recursive}).dir(path, "", des) {
 					return
 				}
 			default:
-				if !once(job{group: i, path: path, label: filepath.Base(path), fi: fi}) {
+				if !once(job{group: groupOf(i), path: path, label: filepath.Base(path), fi: fi}) {
 					return
 				}
 			}

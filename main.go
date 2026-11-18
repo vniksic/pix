@@ -35,6 +35,7 @@ func usage() {
 func main() {
 	sortFlag := flag.String("sort", "name", "sort `ORDER`: name|mtime|date (date taken, else mtime)")
 	outDir := flag.String("out", "", "copy marked files (m) into `DIR` on Enter and on quit")
+	shuffle := flag.Bool("shuffle", false, "random order, different on every run (instead of --sort)")
 	all := flag.Bool("all", false, "include subdirectories, recursively")
 	fullscreen := flag.Bool("fullscreen", false, "start fullscreen")
 	sidebar := flag.Bool("sidebar", true, "start with the sidebar visible")
@@ -58,6 +59,15 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "pix: -sort must be name, mtime or date, not %q\n", *sortFlag)
 		os.Exit(2)
+	}
+	if *shuffle {
+		explicit := false
+		flag.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "sort" })
+		if explicit {
+			fmt.Fprintln(os.Stderr, "pix: --shuffle and --sort do not go together")
+			os.Exit(2)
+		}
+		order = scan.SortShuffle
 	}
 
 	// The copy target is checked now so a wrong one does not come to light

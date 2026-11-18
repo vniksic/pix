@@ -42,6 +42,9 @@ const (
     SortMTime             // oldest first; ties broken by natural name
     SortDate              // by date taken (Options.Taken), files without one fall back
                           // to ModTime; ties by path. Flat across the tree like SortMTime.
+    SortShuffle           // by a hash of Path seeded at random per process: a new order
+                          // every run, stable across rescans. Flat across the tree, and
+                          // an ad-hoc list is shuffled as a whole (one group, -shuffle)
 )
 
 type Options struct {
@@ -669,6 +672,8 @@ and a cache holding the look-ahead plus a few images behind.
                          (its parent is listed recursively, starting at the file)
       -sort name|mtime|date  (default name; date = EXIF date taken, files
                          without one by mtime; mtime and date are flat over the tree)
+      -shuffle           random order (SortShuffle), new each run; exit 2 if
+                         combined with an explicit -sort
       -out DIR           copy destination for marked files (Enter, and on quit)
       -fullscreen        start fullscreen
       -sidebar=false     start with sidebar hidden

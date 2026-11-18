@@ -13,6 +13,7 @@ binary, no config file, meant to be launched from a terminal.
     pix --all a.jpg somedir # same, with somedir's subdirectories too
     find . -name '*.jpg' | pix -        # view the paths read from stdin
     pix --sort date ~/DCIM   # in the order the pictures were taken
+    pix --shuffle --all ~/Pictures  # the whole tree in random order
     pix --all --out ../keep  # cull: mark keepers with m, they are copied to ../keep
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
@@ -100,6 +101,9 @@ Flags go before the paths (`pix --all dir`, not `pix dir --all`). A single
                         sort order (default name, natural order: img2 < img10;
                         mtime and date sort the whole tree with --all; date is
                         the EXIF date taken, files without one use mtime)
+    --shuffle           random order, new on every run; shuffles the whole
+                        tree with --all and the whole list of paths
+                        (instead of --sort)
     --out DIR           where Enter (and quitting) copies the marked images
     --fullscreen        start fullscreen
     --sidebar=false     start with the file list hidden

@@ -4,9 +4,11 @@ package scan
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,10 +31,15 @@ type Entry struct {
 type Sort int
 
 const (
-	SortName  Sort = iota // natural sort on Name, case-insensitive ("img2" < "img10")
-	SortMTime             // oldest first; ties broken by natural name
-	SortDate              // by date taken, oldest first; files without one use ModTime; ties as SortMTime
+	SortName    Sort = iota // natural sort on Name, case-insensitive ("img2" < "img10")
+	SortMTime               // oldest first; ties broken by natural name
+	SortDate                // by date taken, oldest first; files without one use ModTime; ties as SortMTime
+	SortShuffle             // random, fixed for the run; flat across the tree and across an ad-hoc list
 )
+
+// shuffleSeed is random per process, so SortShuffle orders differently on
+// every run but the same way on every rescan of one run.
+var shuffleSeed = maphash.MakeSeed()
 
 // Options configures Resolve and Prepare.
 type Options struct {
@@ -296,7 +303,8 @@ func under(root, path string) (string, bool) {
 
 // Compare orders entries the way List and ListTree sort them: by
 // modification time first for SortMTime, by date taken (Taken, or ModTime
-// when Taken is zero) first for SortDate, then in tree order on Label (a
+// when Taken is zero) first for SortDate, by a hash of Path seeded at
+// random for the run for SortShuffle, then in tree order on Label (a
 // directory's own files before its subdirectories, both in natural order),
 // then by Path.
 func Compare(a, b Entry, sort Sort) int {
@@ -307,6 +315,10 @@ func Compare(a, b Entry, sort Sort) int {
 		}
 	case SortDate:
 		if c := dateKey(a).Compare(dateKey(b)); c != 0 {
+			return c
+		}
+	case SortShuffle:
+		if c := cmp.Compare(maphash.String(shuffleSeed, a.Path), maphash.String(shuffleSeed, b.Path)); c != 0 {
 			return c
 		}
 	}
