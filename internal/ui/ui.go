@@ -1000,7 +1000,7 @@ func (u *viewer) setFullscreen(on bool) {
 	u.applyStatusBar()
 	u.setWindowFullscreen(on)
 	if on {
-		u.vp.view.SetFit()
+		u.vp.view.SetFit() // keeps an enlarging fit (x) but never starts one
 	}
 	u.applySidebar()
 	u.vp.changed()
@@ -1133,7 +1133,7 @@ func (u *viewer) typedRune(r rune) {
 		u.explicitOne()
 		u.vp.changed()
 	case 'x':
-		v.SetFit()
+		v.SetEnlargeFit()
 		u.vp.changed()
 	case '+', '=':
 		v.ZoomBy(KeyStep, v.VW/2, v.VH/2)

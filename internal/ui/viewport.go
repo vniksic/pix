@@ -394,7 +394,7 @@ func (v *viewport) DoubleTapped(e *fyne.PointEvent) {
 			v.view.Pan(ox-v.view.OX, oy-v.view.OY)
 		}
 	} else {
-		v.view.SetFit()
+		v.view.SetEnlargeFit() // the Fit of x
 	}
 	v.changed()
 }

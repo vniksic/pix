@@ -481,11 +481,26 @@ the image box-downsampled by 2, repeatedly (smallest level whose scale is
 still >= the view scale, so the remaining downscale is 1×–2×). Levels are
 built lazily off the main goroutine (parallel over rows), cached with the
 image and dropped when it changes; until a level exists the best existing
-one is used. 1:1 and zoom-in always read the original.
+one is used. 1:1, zoom-in and the enlarging fit always read the original
+(no level is built above 0.5), at a cost per viewport pixel that does not
+depend on the scale: a 16×16 icon enlarged on a 4K screen allocates
+nothing beyond the frame itself.
 
 Modes:
 - Fit: scale = min(vw/rw, vh/rh) where rw,rh are the *rotated* image dims;
-  never upscale above 1.0 unless the user zooms; image centred.
+  image centred. Two kinds, one mode (ModeFit) and a flag (View.Enlarge):
+  - plain fit: never above 1.0, so a small image is shown 1:1. pix starts
+    in it; `f` from 1:1 or free zoom, and an image change after free
+    zoom, return to it.
+  - enlarging fit (`x`, and double-click's Fit side): also scales a small
+    image *up* to fill the viewport (window, or screen in fullscreen),
+    capped at MaxScale (64). Sticky like Fit: kept across image changes,
+    resizes, rotation and (un)fullscreening (`f` keeps it, never starts
+    it), and with the lock; 1:1 (`z`, double-click, a zoom snapping to 1)
+    and wheel / +/- zoom end it. Zooming starts from the enlarged scale,
+    so zooming out goes on smoothly from there; the zoom floor stays a
+    tenth of min(fit, 1). The status line shows the true percentage
+    (above 100%).
 - 1:1: scale 1.0, centred on first entry (or on the cursor point if coming
   from a wheel zoom).
 - Free zoom: any scale from wheel / +/-; zoom around cursor position
@@ -497,13 +512,13 @@ viewport entirely: if the image is smaller than the viewport on an axis it
 is centred on that axis; otherwise edges stay within the viewport.
 Cursor turns to a grab hand while dragging if Fyne supports it (desktop.Cursorable).
 
-Changing image: keep the current mode (fit stays fit; 1:1 stays 1:1 recentred;
-free zoom resets to fit). Rotation resets to 0 on image change, unless
+Changing image: keep the current mode (fit stays fit, enlarging or not;
+1:1 stays 1:1 recentred; free zoom resets to the plain fit). Rotation resets to 0 on image change, unless
 the photo has a remembered rotation (below).
 
 View lock (`l`, View.Locked): while locked, changing image keeps the mode,
 scale, rotation and pan offsets instead (offsets clamped for the new image
-size; Fit re-fits with the kept rotation), so a series of shots can be
+size; Fit re-fits with the kept rotation, enlarging if it was), so a series of shots can be
 compared at the same spot. "loading"/error messages keep the rotation too.
 
 Remembered rotation: `[` / `]` (and `m`, marking: "this one, as shown")
@@ -525,9 +540,9 @@ the displayed rotation, so it includes the remembered one.
     PageUp, Backspace, Left, p    previous image
     Down / Up                     next / previous image (like Right / Left)
     Home / End                    first / last
-    f                             toggle fullscreen; entering fullscreen -> Fit
+    f                             toggle fullscreen; entering fullscreen -> Fit (plain, or enlarging if that was on)
     z                             1:1; in fullscreen also hides the status bar (shown again by Fit via x/double-click, or leaving fullscreen)
-    x                             Fit
+    x                             enlarging Fit (small images scaled up to the window / screen); sticky until z or zoom
     + / = / -                     zoom in / out (×1.25 steps), around viewport centre
     [ / ]                         rotate 90° CCW / CW (view only), stays in current mode (re-fit if Fit); remembered per photo for the session
     Ctrl+C                        copy image to clipboard (PNG, *as displayed rotation applied*, scaled down if over 15 MB)
@@ -547,7 +562,8 @@ the displayed rotation, so it includes the remembered one.
 
 Mouse: wheel = zoom around cursor (×1.1 per notch; GLFW reports 1.5 per
 notch on Wayland vs 1 on X11, so deltas are divided by 1.5 on Wayland); left-drag = pan;
-Shift+left-drag = fast pan; double-click = toggle Fit/1:1.
+Shift+left-drag = fast pan; double-click = toggle Fit/1:1 (from Fit of
+either kind to 1:1 at the cursor; otherwise to the enlarging Fit, as `x`).
 
 ### Help
 

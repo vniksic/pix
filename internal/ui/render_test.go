@@ -133,6 +133,32 @@ func TestRenderScaledCoversExpectedArea(t *testing.T) {
 	}
 }
 
+// The enlarging fit of a 16×16 icon on a 4K screen (capped at MaxScale:
+// 1024×1024, centred) reads the original and draws only that area, with
+// both interpolators.
+func TestRenderEnlargedIcon(t *testing.T) {
+	src := testImage(16, 16)
+	v := &View{}
+	v.SetViewport(3840, 2160)
+	v.SetImage(16, 16)
+	v.SetEnlargeFit()
+	if v.Scale != MaxScale || v.Exact() || mipLevelFor(16, 16, v.Scale) != 0 {
+		t.Fatalf("scale %v exact %v mip %d", v.Scale, v.Exact(), mipLevelFor(16, 16, v.Scale))
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, 3840, 2160))
+	for _, interp := range []xdraw.Interpolator{xdraw.ApproxBiLinear, xdraw.CatmullRom} {
+		renderFrame(dst, src, v.Matrix(), interp, true, nil)
+		if dst.RGBAAt(1400, 1080) != Background || dst.RGBAAt(1920, 560) != Background ||
+			dst.RGBAAt(2440, 1080) != Background || dst.RGBAAt(1920, 1600) != Background {
+			t.Errorf("outside the image should be background")
+		}
+		// Well inside a source pixel the colour is that pixel's.
+		if got, want := dst.RGBAAt(1408+5*64+32, 568+9*64+32), src.NRGBAAt(5, 9); got.R != want.R || got.G != want.G || got.B != want.B {
+			t.Errorf("pixel (5,9) drawn as %v, want %v", got, want)
+		}
+	}
+}
+
 func TestRenderCancel(t *testing.T) {
 	src := testImage(40, 40)
 	dst := image.NewRGBA(image.Rect(0, 0, 300, 300))
@@ -149,6 +175,7 @@ func TestMipLevelFor(t *testing.T) {
 	}{
 		{6000, 4000, 1, 0},
 		{6000, 4000, 4, 0},      // zoom-in reads the original
+		{16, 16, MaxScale, 0},   // enlarging fit of an icon: the original
 		{6000, 4000, 0.6, 0},    // between 0.5 and 1: original
 		{6000, 4000, 0.5, 1},    // exactly half: level 1, no remaining downscale
 		{6000, 4000, 0.3, 1},    // 0.5 >= 0.3 > 0.25

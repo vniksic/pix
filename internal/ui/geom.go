@@ -17,7 +17,7 @@ import (
 type Mode int
 
 const (
-	ModeFit  Mode = iota // scale to fit (never above 1.0), centred
+	ModeFit  Mode = iota // scale to fit (never above 1.0 unless View.Enlarge), centred
 	ModeOne              // 1:1, one image pixel per device pixel
 	ModeFree             // any scale chosen by wheel or +/-
 )
@@ -47,20 +47,27 @@ func RotatedSize(w, h float64, q int) (rw, rh float64) {
 }
 
 // FitScale is the largest scale at which an rw×rh image fits inside vw×vh,
-// capped at 1.0 (fit never upscales). Degenerate input yields 1.
+// capped at 1.0 (the plain fit never upscales). Degenerate input yields 1.
 func FitScale(vw, vh, rw, rh float64) float64 {
+	return fitScale(vw, vh, rw, rh, 1)
+}
+
+// EnlargeFitScale is FitScale for the enlarging fit (x): an image smaller
+// than the viewport is scaled up to fill it, capped at MaxScale.
+func EnlargeFitScale(vw, vh, rw, rh float64) float64 {
+	return fitScale(vw, vh, rw, rh, MaxScale)
+}
+
+func fitScale(vw, vh, rw, rh, limit float64) float64 {
 	if vw <= 0 || vh <= 0 || rw <= 0 || rh <= 0 {
 		return 1
 	}
-	s := math.Min(vw/rw, vh/rh)
-	if s > 1 {
-		s = 1
-	}
-	return s
+	return math.Min(math.Min(vw/rw, vh/rh), limit)
 }
 
 // MinScale is the smallest scale the user may zoom out to: a tenth of the
-// fit scale (or of 1:1, if the image is smaller than the viewport).
+// fit scale (or of 1:1, if the image is smaller than the viewport, also
+// when the enlarging fit shows it above 1:1).
 func MinScale(fit float64) float64 {
 	return math.Min(fit, 1) / 10
 }
@@ -233,6 +240,10 @@ type View struct {
 	// Locked keeps the mode, scale, pan offsets and rotation across image
 	// changes (offsets clamped for the new size) instead of resetting them.
 	Locked bool
+	// Enlarge makes Fit scale an image smaller than the viewport up to fill
+	// it (x, double-click) instead of showing it at 1:1. Only ever true in
+	// ModeFit: leaving Fit (1:1, zooming) clears it.
+	Enlarge bool
 }
 
 // HasImage reports whether there is a non-empty image to show.
@@ -241,9 +252,13 @@ func (v *View) HasImage() bool { return v.ImgW > 0 && v.ImgH > 0 }
 // RotSize returns the rotated image size.
 func (v *View) RotSize() (float64, float64) { return RotatedSize(v.ImgW, v.ImgH, v.Rot) }
 
-// FitScale returns the fit scale for the current image, rotation and viewport.
+// FitScale returns the fit scale for the current image, rotation and
+// viewport: the enlarging one when Enlarge is set.
 func (v *View) FitScale() float64 {
 	rw, rh := v.RotSize()
+	if v.Enlarge {
+		return EnlargeFitScale(v.VW, v.VH, rw, rh)
+	}
 	return FitScale(v.VW, v.VH, rw, rh)
 }
 
@@ -281,8 +296,9 @@ func (v *View) SetViewport(w, h float64) {
 	v.clamp()
 }
 
-// SetImage switches to a new w×h image. Rotation resets to 0. Fit stays fit,
-// 1:1 stays 1:1 (recentred), free zoom resets to fit. When Locked, the
+// SetImage switches to a new w×h image. Rotation resets to 0. Fit stays fit
+// (enlarging or not), 1:1 stays 1:1 (recentred), free zoom resets to the
+// plain fit (zooming ended any enlarging fit). When Locked, the
 // mode, scale, rotation and pan offsets are kept instead (Fit re-fits; the
 // offsets are clamped for the new size).
 func (v *View) SetImage(w, h float64) {
@@ -306,15 +322,26 @@ func (v *View) SetImage(w, h float64) {
 	}
 }
 
-// SetFit switches to Fit mode.
+// SetFit switches to Fit mode, keeping the enlarging fit if it is on
+// (entering fullscreen). From 1:1 or free zoom that is the plain fit.
 func (v *View) SetFit() {
 	v.Mode = ModeFit
 	v.applyFit()
 }
 
+// SetEnlargeFit switches to the enlarging Fit (x, double-click): like
+// SetFit, but an image smaller than the viewport is scaled up to fill it.
+// It stays on across image changes, resizes and rotation until 1:1 or a
+// zoom.
+func (v *View) SetEnlargeFit() {
+	v.Enlarge = true
+	v.SetFit()
+}
+
 // SetOne switches to 1:1, centred.
 func (v *View) SetOne() {
 	v.Mode = ModeOne
+	v.Enlarge = false
 	v.Scale = 1
 	v.centre()
 }
@@ -323,6 +350,7 @@ func (v *View) SetOne() {
 func (v *View) SetOneAt(px, py float64) {
 	v.zoomTo(1, px, py)
 	v.Mode = ModeOne
+	v.Enlarge = false
 }
 
 func (v *View) zoomTo(ns, px, py float64) {
@@ -334,10 +362,13 @@ func (v *View) zoomTo(ns, px, py float64) {
 
 // ZoomBy multiplies the scale by f about viewport point (px, py). Crossing
 // 1.0 snaps to exactly 1:1 (mode One); otherwise the mode becomes Free.
+// Either way it ends the enlarging fit; from one it starts at the enlarged
+// scale, so zooming out goes on smoothly from there.
 func (v *View) ZoomBy(f, px, py float64) {
 	if !v.HasImage() {
 		return
 	}
+	v.Enlarge = false
 	ns := SnapThroughOne(v.Scale, ClampScale(v.Scale*f, v.FitScale()))
 	v.zoomTo(ns, px, py)
 	if ns == 1 {

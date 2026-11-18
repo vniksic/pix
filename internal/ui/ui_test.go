@@ -1,8 +1,11 @@
 package ui
 
 import (
+	"fmt"
 	"image"
+	"image/png"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
 
 	"pix/internal/imgload"
@@ -320,5 +324,153 @@ func TestMergeListing(t *testing.T) {
 	}
 	if want := []string{"a", "b", "c", "e", "f"}; !slices.Equal(got, want) {
 		t.Errorf("merged %q, want %q", got, want)
+	}
+}
+
+// fitViewer builds a viewer over two small PNGs, 20×10 and 10×40, in a
+// 1000×800 window, showing the first.
+func fitViewer(t *testing.T) *viewer {
+	t.Helper()
+	ta := test.NewTempApp(t)
+	a := &loopApp{App: ta, d: &loopDriver{Driver: ta.Driver()}}
+	fyne.SetCurrentApp(a)
+	dir := t.TempDir()
+	var entries []scan.Entry
+	for _, p := range []struct {
+		name string
+		w, h int
+	}{{"wide.png", 20, 10}, {"tall.png", 10, 40}} {
+		path := filepath.Join(dir, p.name)
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img := image.NewNRGBA(image.Rect(0, 0, p.w, p.h))
+		for i := range img.Pix {
+			img.Pix[i] = 0xff
+		}
+		if err := png.Encode(f, img); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		entries = append(entries, scan.Entry{Path: path, Name: p.name, Label: p.name})
+	}
+	u := &viewer{
+		opts:     Options{Target: scan.Target{Root: dir}},
+		app:      a,
+		win:      a.NewWindow("pix"),
+		loader:   imgload.NewLoader(2, 1),
+		entries:  entries,
+		marks:    map[string]bool{},
+		copied:   map[string]bool{},
+		trashing: map[string]bool{},
+		rots:     map[string]int{},
+		gone:     map[string]bool{},
+	}
+	u.build()
+	u.win.Resize(fyne.NewSize(1000, 800))
+	u.show(0)
+	pump(u)
+	if u.vp.img == nil || u.vp.view.VW < 100 || u.vp.view.VH < 100 {
+		t.Fatalf("setup: image %v viewport %vx%v", u.vp.img != nil, u.vp.view.VW, u.vp.view.VH)
+	}
+	return u
+}
+
+// enlarged is the enlarging fit scale for the viewer's current view.
+func enlarged(u *viewer) float64 {
+	v := &u.vp.view
+	rw, rh := v.RotSize()
+	return math.Min(math.Min(v.VW/rw, v.VH/rh), MaxScale)
+}
+
+func TestEnlargeFitKeys(t *testing.T) {
+	u := fitViewer(t)
+	v := &u.vp.view
+	if v.Mode != ModeFit || v.Enlarge || v.Scale != 1 {
+		t.Fatalf("startup: mode %v enlarge %v scale %v, want plain fit at 1", v.Mode, v.Enlarge, v.Scale)
+	}
+	u.typedRune('f') // fullscreen alone does not enlarge
+	if v.Enlarge || v.Scale != 1 {
+		t.Errorf("f: enlarge %v scale %v", v.Enlarge, v.Scale)
+	}
+	u.typedRune('f')
+
+	u.typedRune('x')
+	if !v.Enlarge || v.Mode != ModeFit || v.Scale <= 1 || !near(v.Scale, enlarged(u)) {
+		t.Fatalf("x: enlarge %v mode %v scale %v, want %v", v.Enlarge, v.Mode, v.Scale, enlarged(u))
+	}
+	if want := fmt.Sprintf("   %d%%", v.Percent()); v.Percent() <= 100 || !strings.Contains(u.status.Text, want) {
+		t.Errorf("status %q does not show %d%%", u.status.Text, v.Percent())
+	}
+
+	u.show(1) // the next picture is enlarged too
+	pump(u)
+	if !v.Enlarge || v.ImgH != 40 || !near(v.Scale, enlarged(u)) {
+		t.Errorf("next image: enlarge %v size %vx%v scale %v, want %v", v.Enlarge, v.ImgW, v.ImgH, v.Scale, enlarged(u))
+	}
+
+	u.typedRune('f') // entering fullscreen keeps it
+	if !v.Enlarge || !near(v.Scale, enlarged(u)) {
+		t.Errorf("f in enlarging fit: enlarge %v scale %v, want %v", v.Enlarge, v.Scale, enlarged(u))
+	}
+	u.typedRune('f')
+	if !v.Enlarge || !near(v.Scale, enlarged(u)) {
+		t.Errorf("leaving fullscreen: enlarge %v scale %v", v.Enlarge, v.Scale)
+	}
+
+	u.typedRune(']') // rotation re-fits
+	if !v.Enlarge || v.Rot != 1 || !near(v.Scale, enlarged(u)) {
+		t.Errorf("rotate: enlarge %v rot %v scale %v, want %v", v.Enlarge, v.Rot, v.Scale, enlarged(u))
+	}
+
+	before := v.Scale
+	u.typedRune('-') // zooming out starts from the enlarged scale and ends it
+	if v.Enlarge || v.Mode != ModeFree || !near(v.Scale, before/KeyStep) {
+		t.Errorf("-: enlarge %v mode %v scale %v, want %v", v.Enlarge, v.Mode, v.Scale, before/KeyStep)
+	}
+
+	u.typedRune('x')
+	u.typedRune('z')
+	if v.Enlarge || v.Mode != ModeOne || v.Scale != 1 {
+		t.Errorf("z: enlarge %v mode %v scale %v", v.Enlarge, v.Mode, v.Scale)
+	}
+	u.typedRune('f') // and fullscreen from 1:1 is the plain fit
+	if v.Enlarge || v.Mode != ModeFit || v.Scale != 1 {
+		t.Errorf("f after z: enlarge %v mode %v scale %v", v.Enlarge, v.Mode, v.Scale)
+	}
+}
+
+func TestEnlargeFitDoubleClick(t *testing.T) {
+	u := fitViewer(t)
+	v := &u.vp.view
+	at := &fyne.PointEvent{Position: fyne.NewPos(50, 50)}
+	u.vp.DoubleTapped(at) // plain fit -> 1:1
+	if v.Mode != ModeOne || v.Enlarge {
+		t.Fatalf("first double-click: mode %v enlarge %v", v.Mode, v.Enlarge)
+	}
+	u.vp.DoubleTapped(at) // 1:1 -> the enlarging fit
+	if v.Mode != ModeFit || !v.Enlarge || !near(v.Scale, enlarged(u)) {
+		t.Errorf("second double-click: mode %v enlarge %v scale %v, want %v", v.Mode, v.Enlarge, v.Scale, enlarged(u))
+	}
+	u.vp.DoubleTapped(at) // enlarging fit -> 1:1
+	if v.Mode != ModeOne || v.Enlarge || v.Scale != 1 {
+		t.Errorf("third double-click: mode %v enlarge %v scale %v", v.Mode, v.Enlarge, v.Scale)
+	}
+}
+
+func TestEnlargeFitLock(t *testing.T) {
+	u := fitViewer(t)
+	v := &u.vp.view
+	u.typedRune('x')
+	u.typedRune('l')
+	u.show(1)
+	pump(u)
+	if !v.Locked || !v.Enlarge || v.Mode != ModeFit || !near(v.Scale, enlarged(u)) {
+		t.Errorf("locked: locked %v enlarge %v mode %v scale %v, want %v", v.Locked, v.Enlarge, v.Mode, v.Scale, enlarged(u))
+	}
+	u.typedRune('l') // unlocking changes nothing
+	if v.Locked || !v.Enlarge || !near(v.Scale, enlarged(u)) {
+		t.Errorf("unlocked: enlarge %v scale %v", v.Enlarge, v.Scale)
 	}
 }

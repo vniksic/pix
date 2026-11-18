@@ -41,7 +41,7 @@ while they are read.
 | Home / End                       | first / last image                       |
 | f                                | toggle fullscreen (enters in fit mode)   |
 | z                                | 1:1 pixels (in fullscreen also hides the status bar until x) |
-| x                                | fit to window                            |
+| x                                | fit to window / screen, enlarging small images (until z or zoom) |
 | + / = / -                        | zoom in / out                            |
 | [ / ]                            | rotate 90° left / right (view only; remembered per photo for the session) |
 | Ctrl+C                           | copy image to clipboard (as displayed; scaled down if over 15 MB) |
@@ -60,7 +60,13 @@ while they are read.
 | q                                | quit                                     |
 
 Mouse: wheel zooms around the cursor, left-drag pans, Shift+left-drag pans
-four times faster, double-click toggles fit and 1:1.
+four times faster, double-click toggles fit (as `x`) and 1:1.
+
+pix starts out fitting pictures to the window, but never larger than their real
+size, so a small picture is shown 1:1. `x` fits it to the window (or the
+screen, in fullscreen) even if that means enlarging it; that stays on for the
+following pictures, and through resizing, rotating and fullscreen, until `z`
+or a zoom.
 
 With `--all`, a directory's own pictures come first, then each
 subdirectory in name order, so pictures from one directory stay together.

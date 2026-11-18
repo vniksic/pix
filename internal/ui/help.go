@@ -27,7 +27,7 @@ var helpGroups = [][]helpRow{
 	{
 		{"f", "toggle fullscreen (enters in fit mode)"},
 		{"z", "1:1 pixels (in fullscreen also hides the status bar until x)"},
-		{"x", "fit to window"},
+		{"x", "fit to window / screen, enlarging small images (until z or zoom)"},
 		{"+ / = / -", "zoom in / out"},
 		{"[ / ]", "rotate 90° left / right (view only; remembered per photo for the session)"},
 		{"l", "lock the view: zoom, position and rotation stay when changing image"},

@@ -594,3 +594,150 @@ func TestViewLockedFitKeepsRotation(t *testing.T) {
 		t.Errorf("first image: mode %v scale %v off (%v,%v)", w.Mode, w.Scale, w.OX, w.OY)
 	}
 }
+
+func TestEnlargeFitScale(t *testing.T) {
+	cases := []struct {
+		vw, vh, rw, rh, want float64
+	}{
+		{1000, 800, 200, 100, 5},         // smaller, width-limited: enlarged
+		{1000, 800, 100, 200, 4},         // smaller, height-limited: enlarged
+		{1000, 800, 4000, 3000, 0.25},    // larger: as FitScale
+		{1000, 800, 1000, 800, 1},        // exact
+		{3840, 2160, 16, 16, MaxScale},   // tiny icon on a 4K screen: capped
+		{0, 800, 100, 100, 1},            // degenerate viewport
+		{1000, 800, 0, 100, 1},           // degenerate image
+		{1000, 500, 4000, 3000, 1.0 / 6}, // larger, height-limited
+	}
+	for _, c := range cases {
+		if got := EnlargeFitScale(c.vw, c.vh, c.rw, c.rh); !near(got, c.want) {
+			t.Errorf("EnlargeFitScale(%v,%v,%v,%v) = %v, want %v", c.vw, c.vh, c.rw, c.rh, got, c.want)
+		}
+	}
+}
+
+func TestViewEnlargeFit(t *testing.T) {
+	// Width-limited: 200x100 in 1000x800 -> 5, 1000x500 at (0,150).
+	v := newView(1000, 800, 200, 100)
+	if v.Scale != 1 || v.Enlarge {
+		t.Fatalf("startup fit must not enlarge: scale %v enlarge %v", v.Scale, v.Enlarge)
+	}
+	v.SetEnlargeFit()
+	if v.Mode != ModeFit || !v.Enlarge || !near(v.Scale, 5) || !near(v.OX, 0) || !near(v.OY, 150) {
+		t.Errorf("width-limited: mode %v enlarge %v scale %v off (%v,%v)", v.Mode, v.Enlarge, v.Scale, v.OX, v.OY)
+	}
+	if v.Percent() != 500 {
+		t.Errorf("percent %v, want 500", v.Percent())
+	}
+	// Height-limited: 100x200 -> 4, 400x800 at (300,0).
+	v = newView(1000, 800, 100, 200)
+	v.SetEnlargeFit()
+	if !near(v.Scale, 4) || !near(v.OX, 300) || !near(v.OY, 0) {
+		t.Errorf("height-limited: scale %v off (%v,%v)", v.Scale, v.OX, v.OY)
+	}
+	// A large image fits as before.
+	v = newView(1000, 800, 4000, 3000)
+	v.SetEnlargeFit()
+	if !near(v.Scale, 0.25) || !near(v.OY, 25) {
+		t.Errorf("large: scale %v off (%v,%v)", v.Scale, v.OX, v.OY)
+	}
+}
+
+func TestViewEnlargeFitIsSticky(t *testing.T) {
+	v := newView(1000, 800, 200, 100)
+	v.SetEnlargeFit()
+	v.SetImage(400, 100) // next picture: 2.5
+	if v.Mode != ModeFit || !v.Enlarge || !near(v.Scale, 2.5) || !near(v.OY, 275) {
+		t.Errorf("image change: mode %v enlarge %v scale %v off (%v,%v)", v.Mode, v.Enlarge, v.Scale, v.OX, v.OY)
+	}
+	v.SetViewport(2000, 1000) // 400x100 -> 5
+	if !near(v.Scale, 5) || !near(v.OX, 0) || !near(v.OY, 250) {
+		t.Errorf("resize: scale %v off (%v,%v)", v.Scale, v.OX, v.OY)
+	}
+	v.Rotate(1) // 100x400 in 2000x1000 -> 2.5, 250x1000 at (875,0)
+	if !v.Enlarge || !near(v.Scale, 2.5) || !near(v.OX, 875) || !near(v.OY, 0) {
+		t.Errorf("rotate: enlarge %v scale %v off (%v,%v)", v.Enlarge, v.Scale, v.OX, v.OY)
+	}
+	v.SetFit() // entering fullscreen keeps it
+	if !v.Enlarge || !near(v.Scale, 2.5) {
+		t.Errorf("SetFit dropped the enlarging fit: enlarge %v scale %v", v.Enlarge, v.Scale)
+	}
+	v.SetImage(4000, 1000) // a large one fits as usual, still enlarging for the next
+	if !v.Enlarge || !near(v.Scale, 0.5) {
+		t.Errorf("large in enlarging fit: enlarge %v scale %v", v.Enlarge, v.Scale)
+	}
+
+	v.SetOne() // z ends it
+	if v.Enlarge || v.Mode != ModeOne || v.Scale != 1 {
+		t.Errorf("1:1: enlarge %v mode %v scale %v", v.Enlarge, v.Mode, v.Scale)
+	}
+	v.SetImage(200, 100)
+	v.SetFit() // entering fullscreen from 1:1: the plain fit
+	if v.Enlarge || v.Scale != 1 {
+		t.Errorf("fit after 1:1: enlarge %v scale %v", v.Enlarge, v.Scale)
+	}
+
+	v.SetEnlargeFit()
+	v.SetOneAt(10, 10) // double-click in fit ends it too
+	if v.Enlarge || v.Mode != ModeOne || v.Scale != 1 {
+		t.Errorf("1:1 at point: enlarge %v mode %v scale %v", v.Enlarge, v.Mode, v.Scale)
+	}
+}
+
+func TestViewZoomFromEnlargeFit(t *testing.T) {
+	v := newView(1000, 800, 200, 100)
+	v.SetEnlargeFit() // 5
+	v.ZoomBy(1/WheelStep, 500, 400)
+	if v.Enlarge || v.Mode != ModeFree || !near(v.Scale, 5/WheelStep) {
+		t.Errorf("zoom out: enlarge %v mode %v scale %v, want free at %v", v.Enlarge, v.Mode, v.Scale, 5/WheelStep)
+	}
+	// Further out it stops at 1:1 on the way through, then goes on down.
+	for i := 0; i < 100 && v.Scale > 1; i++ {
+		v.ZoomBy(1/WheelStep, 500, 400)
+	}
+	if v.Scale != 1 || v.Mode != ModeOne {
+		t.Errorf("zooming out should stop at 1:1, got scale %v mode %v", v.Scale, v.Mode)
+	}
+	for i := 0; i < 100; i++ {
+		v.ZoomBy(1/WheelStep, 500, 400)
+	}
+	if !near(v.Scale, MinScale(1)) {
+		t.Errorf("min: %v", v.Scale)
+	}
+	// Free zoom resets to the plain fit on an image change.
+	v.SetImage(200, 100)
+	if v.Mode != ModeFit || v.Enlarge || v.Scale != 1 {
+		t.Errorf("free -> fit: mode %v enlarge %v scale %v", v.Mode, v.Enlarge, v.Scale)
+	}
+
+	// Zooming in from an enlarged fit is capped at MaxScale, as is the fit.
+	v = newView(3840, 2160, 16, 16)
+	v.SetEnlargeFit()
+	if v.Scale != MaxScale || !near(v.OX, (3840-16*MaxScale)/2) || !near(v.OY, (2160-16*MaxScale)/2) {
+		t.Errorf("capped fit: scale %v off (%v,%v)", v.Scale, v.OX, v.OY)
+	}
+	v.ZoomBy(KeyStep, 1920, 1080)
+	if v.Scale != MaxScale || v.Mode != ModeFree {
+		t.Errorf("zoom in past the cap: scale %v mode %v", v.Scale, v.Mode)
+	}
+	v.SetEnlargeFit()
+	v.ZoomBy(1/KeyStep, 1920, 1080)
+	if !near(v.Scale, MaxScale/KeyStep) {
+		t.Errorf("zoom out from the cap: scale %v", v.Scale)
+	}
+}
+
+func TestViewLockedKeepsEnlargeFit(t *testing.T) {
+	v := newView(1000, 800, 200, 100)
+	v.SetEnlargeFit()
+	v.Rotate(1) // 100x200 -> 4
+	v.Locked = true
+	v.SetImage(50, 200) // rotation kept: 200x50 -> 5
+	if v.Mode != ModeFit || !v.Enlarge || v.Rot != 1 || !near(v.Scale, 5) || !near(v.OY, 275) {
+		t.Errorf("locked: mode %v enlarge %v rot %v scale %v off (%v,%v)", v.Mode, v.Enlarge, v.Rot, v.Scale, v.OX, v.OY)
+	}
+	v.Locked = false
+	v.SetImage(200, 100)
+	if !v.Enlarge || v.Rot != 0 || !near(v.Scale, 5) {
+		t.Errorf("unlocked: enlarge %v rot %v scale %v", v.Enlarge, v.Rot, v.Scale)
+	}
+}
