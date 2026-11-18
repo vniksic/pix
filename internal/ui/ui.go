@@ -42,6 +42,7 @@ type Options struct {
 	Fullscreen bool // start fullscreen
 	Sidebar    bool // sidebar visible at start
 	Loader     *imgload.Loader
+	Since      string    // --since's AGE as typed ("1d"), for the status line ("" = no age filter)
 	OutDir     string    // -out: where Enter and quitting copy marked files ("" = nowhere)
 	Stdout     io.Writer // receives the marked paths when Run ends (default os.Stdout)
 }
@@ -203,7 +204,7 @@ func Run(opts Options) error {
 		// Shown before anything else is read; the scan sorts the rest in
 		// around it.
 		u.pinned = t.File
-		u.entries = withPinned(nil, t.File, t.Root, t.Sort)
+		u.entries = withPinned(nil, t.File, t.Root, t.Sort, t.Since)
 	}
 	u.build()
 	u.hypr = onWayland && hypr.Available()
@@ -648,7 +649,8 @@ func (u *viewer) clearPending() {
 // ---- scanning ----
 
 // rescan re-reads the directory (or re-stats an ad-hoc list) in the
-// background and applies the result.
+// background and applies the result. Target.Since, fixed at startup,
+// holds for every rescan.
 func (u *viewer) rescan() {
 	if u.quitting {
 		return
@@ -660,14 +662,14 @@ func (u *viewer) rescan() {
 	if u.scanning {
 		return // the list is being read afresh anyway
 	}
-	old := slices.Clone(u.entries)
+	old, since := slices.Clone(u.entries), u.opts.Target.Since
 	u.startScan(func(ctx context.Context, emit func([]scan.Entry, bool)) error {
 		var out []scan.Entry
 		for _, e := range old {
 			if ctx.Err() != nil {
 				return nil
 			}
-			fi, err := os.Stat(e.Path)
+			fi, err := scan.StatSince(e.Path, since)
 			if err != nil || fi.IsDir() {
 				continue
 			}
@@ -684,9 +686,9 @@ func (u *viewer) rescan() {
 func (u *viewer) listRoot(ctx context.Context, emit func([]scan.Entry, bool)) error {
 	t := u.opts.Target
 	if t.Recursive {
-		return scan.ScanTree(ctx, t.Root, t.Sort, emit)
+		return scan.ScanTree(ctx, t.Root, t.Sort, t.Since, emit)
 	}
-	return scan.ScanList(ctx, t.Root, t.Sort, emit)
+	return scan.ScanList(ctx, t.Root, t.Sort, t.Since, emit)
 }
 
 // startScan cancels the scan in progress, if any, and runs list on a
@@ -707,7 +709,7 @@ func (u *viewer) startScan(list func(ctx context.Context, emit func([]scan.Entry
 		err := list(ctx, func(entries []scan.Entry, done bool) {
 			if t.Root != "" {
 				// Here rather than in applyEntries: it may stat the file.
-				entries = withPinned(entries, pinned, t.Root, t.Sort)
+				entries = withPinned(entries, pinned, t.Root, t.Sort, t.Since)
 			}
 			fyne.Do(func() { u.applyEntries(seq, entries, done, nil) })
 		})
@@ -835,22 +837,27 @@ func (u *viewer) showNone() {
 	u.loading, u.loadSlow = false, false
 	u.loadErr = nil
 	u.win.SetTitle("pix")
-	if u.scanning {
+	switch {
+	case u.scanning:
 		u.vp.SetMessage("scanning…")
-	} else {
+	case !u.opts.Target.Since.IsZero():
+		// "no images" alone would be wrong when older ones were left out.
+		u.vp.SetMessage("no images created since " + u.opts.Target.Since.Format("2006-01-02 15:04"))
+	default:
 		u.vp.SetMessage("no images")
 	}
 	u.updateStatus()
 }
 
 // withPinned returns entries with the file at path inserted at its sorted
-// position if it is missing from the listing of root but still exists. Its
-// Label is recomputed relative to root, as the listing's are.
-func withPinned(entries []scan.Entry, path, root string, sort scan.Sort) []scan.Entry {
+// position if it is missing from the listing of root but still exists and
+// was not created before since (Target.Since; zero: no limit). Its Label is
+// recomputed relative to root, as the listing's are.
+func withPinned(entries []scan.Entry, path, root string, sort scan.Sort, since time.Time) []scan.Entry {
 	if path == "" || slices.ContainsFunc(entries, func(e scan.Entry) bool { return e.Path == path }) {
 		return entries
 	}
-	fi, err := os.Stat(path)
+	fi, err := scan.StatSince(path, since)
 	if err != nil || !fi.Mode().IsRegular() {
 		return entries
 	}
@@ -913,6 +920,7 @@ func (u *viewer) updateStatus() {
 	s := statusInfo{
 		Empty:    len(u.entries) == 0,
 		Scanning: u.scanning,
+		Since:    u.opts.Since,
 		Locked:   u.vp.view.Locked,
 		NMarked:  u.nMarked,
 		Flash:    u.flash,

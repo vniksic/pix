@@ -160,7 +160,7 @@ func TestScanMatchesSync(t *testing.T) {
 				t.Fatal(err)
 			}
 			snaps := record(t, func(emit func([]Entry, bool)) {
-				if err := listScan(bg, root, sort, emit); err != nil {
+				if err := listScan(bg, root, sort, time.Time{}, emit); err != nil {
 					t.Fatal(err)
 				}
 			})
@@ -169,7 +169,7 @@ func TestScanMatchesSync(t *testing.T) {
 	}
 
 	calls := 0
-	err := ScanTree(bg, filepath.Join(root, "missing"), SortName, func([]Entry, bool) { calls++ })
+	err := ScanTree(bg, filepath.Join(root, "missing"), SortName, time.Time{}, func([]Entry, bool) { calls++ })
 	if err == nil || calls != 0 {
 		t.Errorf("ScanTree(missing) = %v after %d emits", err, calls)
 	}
@@ -269,7 +269,7 @@ func TestScanCancel(t *testing.T) {
 	var emits, atCancel atomic.Int32
 	returned := make(chan error)
 	go func() {
-		returned <- ScanTree(ctx, root, SortDate, func([]Entry, bool) {
+		returned <- ScanTree(ctx, root, SortDate, time.Time{}, func([]Entry, bool) {
 			if emits.Add(1) == 1 {
 				atCancel.Store(int32(f.total()))
 				cancel()

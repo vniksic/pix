@@ -53,7 +53,7 @@ func TestWithPinned(t *testing.T) {
 		if err != nil || len(listed) != 3 {
 			t.Fatalf("List: %v %v", names(listed), err)
 		}
-		got := names(withPinned(listed, pinned, dir, c.sort))
+		got := names(withPinned(listed, pinned, dir, c.sort, time.Time{}))
 		if len(got) != len(c.want) {
 			t.Fatalf("sort %d: got %v, want %v", c.sort, got, c.want)
 		}
@@ -63,16 +63,26 @@ func TestWithPinned(t *testing.T) {
 			}
 		}
 		// Already listed: unchanged.
-		if again := withPinned(listed, listed[0].Path, dir, c.sort); len(again) != 3 {
+		if again := withPinned(listed, listed[0].Path, dir, c.sort, time.Time{}); len(again) != 3 {
 			t.Errorf("listed pin duplicated: %v", names(again))
 		}
+	}
+
+	// --since: a pinned file created before the cutoff is not inserted
+	// (a cutoff in the future, as creation times cannot be set).
+	listed, _ := scan.List(dir, scan.SortName)
+	if got := withPinned(listed, pinned, dir, scan.SortName, time.Now().Add(time.Hour)); len(got) != 3 {
+		t.Errorf("pin older than the cutoff inserted: %v", names(got))
+	}
+	if got := withPinned(listed, pinned, dir, scan.SortName, time.Now().Add(-time.Hour)); len(got) != 4 {
+		t.Errorf("pin newer than the cutoff left out: %v", names(got))
 	}
 
 	if err := os.Remove(pinned); err != nil {
 		t.Fatal(err)
 	}
-	listed, _ := scan.List(dir, scan.SortName)
-	if got := withPinned(listed, pinned, dir, scan.SortName); len(got) != 3 {
+	listed, _ = scan.List(dir, scan.SortName)
+	if got := withPinned(listed, pinned, dir, scan.SortName, time.Time{}); len(got) != 3 {
 		t.Errorf("deleted pin re-inserted: %v", names(got))
 	}
 }
@@ -117,7 +127,7 @@ func TestWithPinnedTree(t *testing.T) {
 		// Inside its subdirectory, with a root-relative label.
 		{"sub/m.dat", []string{"b.png", "sub/a.png", "sub/m.dat", "sub/z.png"}},
 	} {
-		got := labels(withPinned(slices.Clone(listed), filepath.Join(root, c.pinned), root, scan.SortName))
+		got := labels(withPinned(slices.Clone(listed), filepath.Join(root, c.pinned), root, scan.SortName, time.Time{}))
 		if !slices.Equal(got, c.want) {
 			t.Errorf("pin %s: got %q, want %q", c.pinned, got, c.want)
 		}

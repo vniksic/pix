@@ -9,7 +9,7 @@ Module name: `pix`. Binary: `pix`. Go 1.26 (go.mod already set up, deps fetched)
 ## Layout
 
     main.go                 flags, wiring, exit codes
-    internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, dir watch
+    internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, age filter, dir watch
     internal/imgload/       decoding (all formats), EXIF orientation and date taken, async LRU cache
     internal/camraw/        camera raw containers: the embedded JPEG previews, orientation, date taken
     internal/fileops/       copying marked files out, freedesktop trash, permanent delete, opening in another program
@@ -52,6 +52,7 @@ type Options struct {
     Sort      Sort
     Recursive bool // expand directories with ListTree instead of List (-all)
     Taken     func(path string) (time.Time, bool) // for SortDate; nil -> SortDate behaves like SortMTime
+    Since     time.Time // -since: only files created at or after it (StatSince); zero = all
 }
 
 // Resolve turns CLI args into a playlist.
@@ -68,6 +69,9 @@ type Options struct {
 // path relative to the cwd when the file is under it, else the absolute
 // path with $HOME shortened to "~". Ad-hoc lists keep argument order (each
 // expanded dir sorted internally) and drop duplicates.
+// With opts.Since, every file (named ones included, the single file arg
+// too: it is then not pinned and the listing starts at 0) created before
+// it is left out; directories are expanded whatever their own age.
 // args == []string{"-"} reads newline-separated paths from os.Stdin (CRLF
 // tolerated, blank lines skipped, relative paths against the cwd,
 // directories expanded like other ad-hoc args, missing paths skipped),
@@ -88,6 +92,7 @@ type Target struct {
     Paths     []string // ad-hoc list: the paths, absolute, in argument order
     Sort      Sort
     Recursive bool
+    Since     time.Time // Options.Since; every scan and rescan of the Target uses it
 }
 
 // Prepare is the cheap front half of Resolve, run before the window
@@ -103,19 +108,35 @@ func PrepareReader(r io.Reader, opts Options) (Target, error)
 // Each call gets a fresh slice (never touched again) holding exactly the
 // entries fully processed so far (stat + sniff + Taken for SortDate), in
 // their final order, labelled as Resolve labels them; nothing is emitted
-// before it is sniffed, so an entry never appears and then vanishes. The
+// before it is sniffed, so an entry never appears and then vanishes.
+// With t.Since a file created before it goes after its one stat
+// (StatSince), never opened. The
 // first snapshot goes out as soon as 8 entries are in, later ones at most
 // every 100ms, and the last one has done=true (exactly once). Calls are
 // sequential, on the caller's goroutine. Cancelling ctx stops new file
 // work and returns at once; emit is not called again. t.File is in every
-// snapshot; an unreadable root gives an empty listing (but for t.File).
+// snapshot (unless t.Since leaves it out); an unreadable root gives an
+// empty listing (but for t.File).
 func Scan(ctx context.Context, t Target, emit func(entries []Entry, done bool))
 
 // ScanList and ScanTree are List and ListTree delivering snapshots like
-// Scan. An unreadable dir/root is returned as the error, with no emit.
-// List and ListTree are these run to the end.
-func ScanList(ctx context.Context, dir string, sort Sort, emit func(entries []Entry, done bool)) error
-func ScanTree(ctx context.Context, root string, sort Sort, emit func(entries []Entry, done bool)) error
+// Scan, limited by since as Target.Since (zero: no limit). An unreadable
+// dir/root is returned as the error, with no emit. List and ListTree are
+// these run to the end with no limit.
+func ScanList(ctx context.Context, dir string, sort Sort, since time.Time, emit func(entries []Entry, done bool)) error
+func ScanTree(ctx context.Context, root string, sort Sort, since time.Time, emit func(entries []Entry, done bool)) error
+
+// StatSince is os.Stat (follows symlinks) when since is zero. Otherwise a
+// file created before since is an error (a directory never is), and the
+// one stat call also gives the creation time: on Linux statx(2) with
+// STATX_BTIME, the birth time when the mask has it (and it is non-zero),
+// else the mtime, per file (sshfs reports none; kernels without statx get
+// os.Stat). Other OSes: always the mtime. Never the EXIF date. Every way a
+// file enters a playlist goes through it: the workers' stat, statAll, the
+// pinned file (scanRoot and ui's withPinned) and ui's re-stat of an
+// ad-hoc list. The lookup is the variable statBorn, faked in tests (birth
+// times cannot be set).
+func StatSince(path string, since time.Time) (os.FileInfo, error)
 
 // How the streaming scans work: directory reads are sequential on one
 // goroutine (the tree walk feeds files as it goes); the per-file work
@@ -418,8 +439,12 @@ goroutine via fyne.Do. Scan goroutines never touch viewer state.
 - While the scan of the startup (or a rescan that has delivered a partial
   snapshot) runs, the status line has a `scanning…` part, and an empty
   playlist shows "scanning…" in the viewport; "no images" only once the
-  scan is done. A scan that finds nothing leaves the window open on "no
+  scan is done (with -since: "no images created since 2006-01-02 15:04",
+  the cutoff, since older ones may well exist). A scan that finds nothing leaves the window open on "no
   images" (exit code 0 on quit).
+- With --since the status line has a `since AGE` part (AGE as typed,
+  ui.Options.Since) after the position, and after "no images" or a lone
+  "scanning…".
 - The sidebar is built before the list is known: an ad-hoc list
   switches to two-line rows (a new list widget) once a label with a
   directory part arrives.
@@ -712,6 +737,10 @@ named on the command line stays in the list while it exists even if the
 listing leaves it out (hidden, unsniffable); it is inserted at its sorted
 position with its Label recomputed relative to Root. Ad-hoc lists are not
 watched; `r` re-stats them (ignored while the startup scan still runs).
+With -since every rescan, the re-stat and the pinned file use
+Target.Since, the cutoff main fixed at startup: nothing drops out as the
+session goes on, a file created later comes in, and one created before
+the cutoff (an old file moved in keeps its birth time) does not.
 
 ### Prefetch
 
@@ -745,6 +774,11 @@ and a cache holding the look-ahead plus a few images behind.
                          without one by mtime; mtime and date are flat over the tree)
       -shuffle           random order (SortShuffle), new each run; exit 2 if
                          combined with an explicit -sort
+      -since AGE         only files created (StatSince) in the last AGE: a whole
+                         number > 0 and one unit, m h d w (90m, 12h, 1d, 2w);
+                         anything else, or more than a time.Duration holds
+                         (~292 years), exits 2. Implies -all. The cutoff
+                         (now - AGE) is fixed at startup (Options.Since)
       -out DIR           copy destination for marked files (Enter, and on quit)
       -fullscreen        start fullscreen
       -sidebar=false     start with sidebar hidden

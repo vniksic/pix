@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"hash/maphash"
 	"io"
@@ -49,6 +48,10 @@ type Options struct {
 	// SortDate. It may be called concurrently. nil makes SortDate order
 	// like SortMTime.
 	Taken func(path string) (time.Time, bool)
+	// Since, when set, keeps only the files created at or after it (see
+	// StatSince); directories are expanded whatever their own age. It
+	// applies to named files too, and to every rescan of the Target.
+	Since time.Time
 }
 
 // Target is a command line resolved without listing anything (see
@@ -58,7 +61,8 @@ type Target struct {
 	File      string   // the file named on its own (Root is its parent); "" otherwise
 	Paths     []string // the ad-hoc list's paths, absolute, in order (Root == "")
 	Sort      Sort
-	Recursive bool // directories are listed with ListTree
+	Recursive bool      // directories are listed with ListTree
+	Since     time.Time // only files created at or after it (zero: all); see StatSince
 }
 
 // Resolve turns CLI args into a playlist.
@@ -76,7 +80,9 @@ type Target struct {
 // keep the argument order (each expanded directory is sorted internally),
 // drop duplicates, and label each file relative to the working directory
 // when it is under it, else by its absolute path with $HOME shortened to
-// "~". Returns an error only when nothing is viewable.
+// "~". Returns an error only when nothing is viewable. With opts.Since
+// only the files created at or after it are listed, named files included
+// (see StatSince).
 //
 // The single argument "-" reads the list of paths from standard input
 // (see ResolveReader).
@@ -111,14 +117,18 @@ func ResolveReader(r io.Reader, opts Options) (entries []Entry, start int, roots
 // resolve scans t to the end and works out the rest of Resolve's results.
 func resolve(t Target) (entries []Entry, start int, roots []string, err error) {
 	entries = final(func(emit func([]Entry, bool)) { Scan(context.Background(), t, emit) })
+	images := "images"
+	if !t.Since.IsZero() {
+		images = "images created since " + t.Since.Format("2006-01-02 15:04")
+	}
 	switch {
 	case len(entries) > 0:
 	case t.Root == "":
-		return nil, 0, nil, errors.New("no viewable images among the given paths")
+		return nil, 0, nil, fmt.Errorf("no viewable %s among the given paths", images)
 	case t.Recursive:
-		return nil, 0, nil, fmt.Errorf("no images in %s or below it", t.Root)
+		return nil, 0, nil, fmt.Errorf("no %s in %s or below it", images, t.Root)
 	default:
-		return nil, 0, nil, fmt.Errorf("no images in %s", t.Root)
+		return nil, 0, nil, fmt.Errorf("no %s in %s", images, t.Root)
 	}
 	if t.Root != "" {
 		roots = []string{t.Root}
@@ -143,7 +153,7 @@ func Prepare(args []string, opts Options) (Target, error) {
 		return PrepareReader(os.Stdin, opts)
 	}
 	setTakenSource(opts.Taken)
-	t := Target{Sort: opts.Sort, Recursive: opts.Recursive}
+	t := Target{Sort: opts.Sort, Recursive: opts.Recursive, Since: opts.Since}
 	switch len(args) {
 	case 0:
 		cwd, err := os.Getwd()
@@ -190,7 +200,7 @@ func PrepareReader(r io.Reader, opts Options) (Target, error) {
 	if err := sc.Err(); err != nil {
 		return Target{}, fmt.Errorf("reading path list: %w", err)
 	}
-	return Target{Paths: absPaths(paths), Sort: opts.Sort, Recursive: opts.Recursive}, nil
+	return Target{Paths: absPaths(paths), Sort: opts.Sort, Recursive: opts.Recursive, Since: opts.Since}, nil
 }
 
 // absPaths makes paths absolute, dropping the ones that cannot be.
@@ -220,10 +230,11 @@ func indexOf(entries []Entry, path string) int {
 // List returns the readable images directly inside dir (no recursion),
 // hidden files (leading dot) excluded, sorted. Symlinks followed. Each
 // Label is the file's Name. SortDate uses the Taken function of the last
-// Resolve or Prepare (see there). It is ScanList run to the end.
+// Resolve or Prepare (see there). It is ScanList run to the end, with no
+// age limit.
 func List(dir string, sort Sort) ([]Entry, error) {
 	var err error
-	entries := final(func(emit func([]Entry, bool)) { err = ScanList(context.Background(), dir, sort, emit) })
+	entries := final(func(emit func([]Entry, bool)) { err = ScanList(context.Background(), dir, sort, time.Time{}, emit) })
 	return entries, err
 }
 
@@ -238,10 +249,10 @@ func List(dir string, sort Sort) ([]Entry, error) {
 // pictures stay together. SortMTime is one flat oldest-first order over the
 // whole tree, ties broken by path; so is SortDate, by date taken (Taken of
 // the last Resolve or Prepare) falling back to ModTime. It is ScanTree run
-// to the end.
+// to the end, with no age limit.
 func ListTree(root string, sort Sort) ([]Entry, error) {
 	var err error
-	entries := final(func(emit func([]Entry, bool)) { err = ScanTree(context.Background(), root, sort, emit) })
+	entries := final(func(emit func([]Entry, bool)) { err = ScanTree(context.Background(), root, sort, time.Time{}, emit) })
 	return entries, err
 }
 

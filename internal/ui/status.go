@@ -14,8 +14,9 @@ const takenLayout = "2006-01-02 15:04"
 
 // statusInfo is everything the status line shows; statusText composes it.
 type statusInfo struct {
-	Empty    bool // no images: everything up to the image details is replaced by "no images" (or "scanning…")
-	Scanning bool // the playlist is still being filled in
+	Empty    bool   // no images: everything up to the image details is replaced by "no images" (or "scanning…")
+	Scanning bool   // the playlist is still being filled in
+	Since    string // --since's AGE ("1d") when the list is limited by age
 	Label    string
 	Marked   bool // the current entry is marked
 	Index    int  // 0-based position of the current entry
@@ -36,9 +37,11 @@ type statusInfo struct {
 
 // statusText composes the status line:
 //
-//	label ★   12/87   scanning…   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <flash>
+//	label ★   12/87   since 1d   scanning…   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <flash>
 //
 // The dimensions of a camera raw file's preview read "1616×1080 ARW preview".
+//
+// "since 1d" (--since) also follows "no images" and a lone "scanning…".
 //
 // Parts that do not apply are left out.
 func statusText(s statusInfo) string {
@@ -48,12 +51,21 @@ func statusText(s statusInfo) string {
 		parts = append(parts, "scanning…")
 	case s.Empty:
 		parts = append(parts, "no images")
+	}
+	if s.Empty && s.Since != "" {
+		parts = append(parts, "since "+s.Since)
+	}
+	switch {
+	case s.Empty:
 	default:
 		label := s.Label
 		if s.Marked {
 			label += " ★"
 		}
 		parts = append(parts, label, fmt.Sprintf("%d/%d", s.Index+1, s.Count))
+		if s.Since != "" {
+			parts = append(parts, "since "+s.Since)
+		}
 		if s.Scanning {
 			parts = append(parts, "scanning…")
 		}

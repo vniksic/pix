@@ -14,6 +14,7 @@ binary, no config file, meant to be launched from a terminal.
     find . -name '*.jpg' | pix -        # view the paths read from stdin
     pix --sort date ~/DCIM   # in the order the pictures were taken
     pix --shuffle --all ~/Pictures  # the whole tree in random order
+    pix --since 1d ~/Pictures       # only pictures added in the last day, whole tree
     pix --all --out ../keep  # cull: mark keepers with m, they are copied to ../keep
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
@@ -72,7 +73,8 @@ The directory (or with `--all` the whole tree, up to 2000 directories) is
 watched, so files that appear or vanish show up without a restart. A list of
 paths is not watched; `r` re-checks it.
 
-The status bar shows the path, position, size, the date the picture was
+The status bar shows the path, position, `since 1d` when `--since` limits
+the list, size, the date the picture was
 taken (when its EXIF has one), zoom and rotation, plus "lock" while the view
 is locked and how many images are marked.
 
@@ -114,12 +116,22 @@ Flags go before the paths (`pix --all dir`, not `pix dir --all`). A single
     --shuffle           random order, new on every run; shuffles the whole
                         tree with --all and the whole list of paths
                         (instead of --sort)
+    --since AGE         only pictures created in the last AGE: a number and
+                        m, h, d or w (minutes, hours, days, weeks), like 90m,
+                        12h, 1d, 2w; implies --all
     --out DIR           where Enter (and quitting) copies the marked images
     --fullscreen        start fullscreen
     --sidebar=false     start with the file list hidden
     --version
 
 A single dash works too (`-all`).
+
+`--since` goes by the file's creation time on disk (when it was copied or
+saved there), not the date the picture was taken. Where the filesystem does
+not record one (sshfs, for one, and anything but Linux) the modification
+time is used instead. Named files and lists of paths are filtered too. The
+cutoff is fixed when pix starts, so nothing drops out of the list while you
+look, and new pictures still turn up in a watched directory.
 
 ## Download
 

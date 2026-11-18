@@ -75,3 +75,19 @@ func TestCopySummary(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusSince(t *testing.T) {
+	for _, c := range []struct {
+		s    statusInfo
+		want string
+	}{
+		{statusInfo{Label: "a.jpg", Index: 1, Count: 5, Since: "1d", Scanning: true}, "a.jpg   2/5   since 1d   scanning…"},
+		{statusInfo{Label: "a.jpg", Index: 1, Count: 5}, "a.jpg   2/5"},
+		{statusInfo{Empty: true, Since: "2w"}, "no images   since 2w"},
+		{statusInfo{Empty: true, Scanning: true, Since: "2w"}, "scanning…   since 2w"},
+	} {
+		if got := statusText(c.s); got != c.want {
+			t.Errorf("statusText(%+v) = %q, want %q", c.s, got, c.want)
+		}
+	}
+}

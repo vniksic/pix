@@ -10,6 +10,7 @@ require (
 	github.com/gen2brain/jpegxl v0.6.0
 	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
 	golang.org/x/image v0.47.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -45,7 +46,6 @@ require (
 	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
 	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -32,39 +32,44 @@ const firstSnapshot = 8
 // on the caller's goroutine. When ctx is cancelled, Scan stops starting new
 // file work and returns at once, and emit is not called again.
 //
-// A file named on its own (t.File) is in every snapshot. An unreadable
-// listing root gives an empty listing (but for t.File).
+// A file named on its own (t.File) is in every snapshot, unless t.Since
+// leaves it out. An unreadable listing root gives an empty listing (but
+// for t.File). With t.Since, files created before it are left out after
+// one stat (StatSince), before anything else is read from them.
 func Scan(ctx context.Context, t Target, emit func(entries []Entry, done bool)) {
 	if t.Root == "" {
 		scanAdhoc(ctx, t, emit)
 		return
 	}
-	if scanRoot(ctx, t.Root, t.File, t.Sort, t.Recursive, emit) != nil && ctx.Err() == nil {
+	if scanRoot(ctx, t.Root, t.File, t.Sort, t.Since, t.Recursive, emit) != nil && ctx.Err() == nil {
 		emit(nil, true)
 	}
 }
 
-// ScanList is List delivering snapshots as Scan does. It returns an error,
-// without calling emit, when dir cannot be read.
-func ScanList(ctx context.Context, dir string, sort Sort, emit func(entries []Entry, done bool)) error {
-	return scanRoot(ctx, dir, "", sort, false, emit)
+// ScanList is List delivering snapshots as Scan does, limited to the files
+// created at or after since unless it is zero (as Target.Since). It
+// returns an error, without calling emit, when dir cannot be read.
+func ScanList(ctx context.Context, dir string, sort Sort, since time.Time, emit func(entries []Entry, done bool)) error {
+	return scanRoot(ctx, dir, "", sort, since, false, emit)
 }
 
-// ScanTree is ListTree delivering snapshots as Scan does. It returns an
-// error, without calling emit, when root cannot be read.
-func ScanTree(ctx context.Context, root string, sort Sort, emit func(entries []Entry, done bool)) error {
-	return scanRoot(ctx, root, "", sort, true, emit)
+// ScanTree is ListTree delivering snapshots as Scan does, limited by since
+// like ScanList. It returns an error, without calling emit, when root
+// cannot be read.
+func ScanTree(ctx context.Context, root string, sort Sort, since time.Time, emit func(entries []Entry, done bool)) error {
+	return scanRoot(ctx, root, "", sort, since, true, emit)
 }
 
 // scanRoot lists root (recursively when recursive), plus file, when set,
-// which is kept even if the listing would leave it out. Without file an
-// unreadable root is returned as the error before anything is emitted.
-func scanRoot(ctx context.Context, root, file string, sort Sort, recursive bool, emit func([]Entry, bool)) error {
+// which is kept even if the listing would leave it out (but not if it was
+// created before since). Without file an unreadable root is returned as
+// the error before anything is emitted.
+func scanRoot(ctx context.Context, root, file string, sort Sort, since time.Time, recursive bool, emit func([]Entry, bool)) error {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return err
 	}
-	s := newScanner(sort, 1)
+	s := newScanner(sort, since, 1)
 	if file != "" {
 		if e, ok := s.process(job{path: file, label: filepath.Base(file), force: true}); ok {
 			s.add(0, e)
@@ -92,7 +97,7 @@ func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 	if t.Sort == SortShuffle {
 		groupOf, groups = func(int) int { return 0 }, 1
 	}
-	s := newScanner(t.Sort, groups)
+	s := newScanner(t.Sort, t.Since, groups)
 	// Sorted with the labels of each directory's own listing, as List
 	// gives them; relabelled for the snapshot.
 	s.relabel = func(path string) string { return adhocLabel(path, cwd, home) }
@@ -105,7 +110,7 @@ func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 			seen[j.path] = true
 			return send(j)
 		}
-		stats := statAll(ctx, t.Paths)
+		stats := statAll(ctx, t.Paths, t.Since)
 		for i, path := range t.Paths {
 			var fi os.FileInfo
 			select {
@@ -114,7 +119,7 @@ func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 				return
 			}
 			switch {
-			case fi == nil: // missing
+			case fi == nil: // missing, or created before t.Since
 			case fi.IsDir():
 				des, err := os.ReadDir(path)
 				if err == nil && !(lister{ctx: ctx, send: once, group: groupOf(i), recursive: t.Recursive}).dir(path, "", des) {
@@ -131,10 +136,11 @@ func scanAdhoc(ctx context.Context, t Target, emit func([]Entry, bool)) {
 
 // statAll stats paths concurrently, a pool's worth at a time, ahead of
 // whoever reads the results: paths[i]'s FileInfo (nil when it cannot be
-// stat'ed) arrives on the i-th channel. Ad-hoc lists read from stdin can be
+// stat'ed, or is a file created before since; see StatSince) arrives on
+// the i-th channel. Ad-hoc lists read from stdin can be
 // long, and the directory arguments among them must be told apart from the
 // files before the list can be put in order.
-func statAll(ctx context.Context, paths []string) []chan os.FileInfo {
+func statAll(ctx context.Context, paths []string, since time.Time) []chan os.FileInfo {
 	out := make([]chan os.FileInfo, len(paths))
 	for i := range out {
 		out[i] = make(chan os.FileInfo, 1)
@@ -149,7 +155,7 @@ func statAll(ctx context.Context, paths []string) []chan os.FileInfo {
 			}
 			go func() {
 				defer func() { <-sem }()
-				fi, err := os.Stat(p)
+				fi, err := StatSince(p, since)
 				if err != nil {
 					fi = nil
 				}
@@ -212,6 +218,7 @@ type job struct {
 // listing, one per argument for an ad-hoc list.
 type scanner struct {
 	sort    Sort
+	since   time.Time // StatSince's cutoff; zero: none
 	c       *takenCache
 	relabel func(path string) string // nil: keep the listing's labels
 
@@ -227,8 +234,8 @@ type group struct {
 	added  []Entry // since then, unsorted
 }
 
-func newScanner(sort Sort, groups int) *scanner {
-	return &scanner{sort: sort, c: takenSource.Load(), groups: make([]group, groups), early: make(chan struct{})}
+func newScanner(sort Sort, since time.Time, groups int) *scanner {
+	return &scanner{sort: sort, since: since, c: takenSource.Load(), groups: make([]group, groups), early: make(chan struct{})}
 }
 
 // run processes the jobs discover sends on a pool of workers and emits
@@ -292,12 +299,14 @@ func (s *scanner) run(ctx context.Context, emit func([]Entry, bool), discover fu
 	}
 }
 
-// process does the per-file work: stat (unless known), sniff, date.
+// process does the per-file work: stat (unless known), sniff, date. A file
+// created before s.since goes after the stat (a known j.fi has passed
+// StatSince already, in statAll).
 func (s *scanner) process(j job) (Entry, bool) {
 	fi := j.fi
 	if fi == nil {
 		var err error
-		if fi, err = os.Stat(j.path); err != nil { // follows symlinks
+		if fi, err = StatSince(j.path, s.since); err != nil { // follows symlinks
 			return Entry{}, false
 		}
 	}
