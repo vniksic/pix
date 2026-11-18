@@ -20,6 +20,7 @@ func TestStatusText(t *testing.T) {
 		{"plain", img, "sub/a.jpg   12/87   4000×3000   33%"},
 		{"marked", with(func(s *statusInfo) { s.Marked = true }), "sub/a.jpg ★   12/87   4000×3000   33%"},
 		{"date", with(func(s *statusInfo) { s.Taken = taken }), "sub/a.jpg   12/87   4000×3000   2024-05-01 14:03   33%"},
+		{"raw", with(func(s *statusInfo) { s.Raw, s.W, s.H = "ARW", 1616, 1080 }), "sub/a.jpg   12/87   1616×1080 ARW preview   33%"},
 		{"rotated", with(func(s *statusInfo) { s.Rot = 3 }), "sub/a.jpg   12/87   4000×3000   33%   ↻270°"},
 		{"lock", with(func(s *statusInfo) { s.Locked = true }), "sub/a.jpg   12/87   4000×3000   33%   lock"},
 		{"n marked", with(func(s *statusInfo) { s.NMarked = 3 }), "sub/a.jpg   12/87   4000×3000   33%   3 marked"},
@@ -48,6 +49,7 @@ func TestCopySummary(t *testing.T) {
 	rot := fileops.CopyResult{Src: "/d", Dst: "/out/d", Rotated: true}
 	png := fileops.CopyResult{Src: "/e", Dst: "/out/e", RotLost: "png"}
 	heic := fileops.CopyResult{Src: "/f", Dst: "/out/f", RotLost: "heic"}
+	cr2 := fileops.CopyResult{Src: "/i", Dst: "/out/i", RotLost: "cr2"}
 	skipRot := fileops.CopyResult{Src: "/g", Dst: "/out/g", Skipped: true, Rotated: true}
 	skipPNG := fileops.CopyResult{Src: "/h", Dst: "/out/h", Skipped: true, RotLost: "png"}
 	for _, c := range []struct {
@@ -63,6 +65,7 @@ func TestCopySummary(t *testing.T) {
 		{[]fileops.CopyResult{rot, ok, rot}, "copied 3 to ../keep (2 rotated)", false},
 		{[]fileops.CopyResult{ok, png, rot}, "copied 3 to ../keep (1 rotated), rotation not stored for 1 (png)", false},
 		{[]fileops.CopyResult{heic, png, png}, "copied 3 to ../keep, rotation not stored for 3 (heic, png)", false},
+		{[]fileops.CopyResult{cr2, rot}, "copied 2 to ../keep (1 rotated), rotation not stored for 1 (cr2)", false},
 		{[]fileops.CopyResult{rot, skipRot, skipPNG}, "copied 1 (1 rotated), skipped 2 (already there), rotation not stored for 1 (png)", false},
 		{[]fileops.CopyResult{rot, bad, png}, "copied 2 (1 rotated), copy failed: disk full", true},
 	} {

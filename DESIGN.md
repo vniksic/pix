@@ -11,6 +11,7 @@ Module name: `pix`. Binary: `pix`. Go 1.26 (go.mod already set up, deps fetched)
     main.go                 flags, wiring, exit codes
     internal/scan/          directory listing (flat or recursive), image sniffing, natural sort, labels, dir watch
     internal/imgload/       decoding (all formats), EXIF orientation and date taken, async LRU cache
+    internal/camraw/        camera raw containers: the embedded JPEG previews, orientation, date taken
     internal/fileops/       copying marked files out, freedesktop trash, permanent delete, opening in another program
     internal/clipboard/     image/text copy via wl-copy (Wayland) or xclip (X11)
     internal/hypr/          Hyprland control-socket client (fullscreen on the current monitor)
@@ -147,9 +148,12 @@ func Compare(a, b Entry, sort Sort) int
 func RelLabel(root, path string) string
 
 // IsImage sniffs the first 64 bytes. Must recognise:
-// JPEG, PNG, GIF, WebP (RIFF....WEBP), BMP, TIFF (II*\0 / MM\0*),
-// HEIC/HEIF (ftyp heic|heix|hevc|mif1|msf1), AVIF (ftyp avif|avis),
-// JPEG XL (FF 0A, or 00 00 00 0C 4A 58 4C 20 0D 0A 87 0A).
+// JPEG, PNG, GIF, WebP (RIFF....WEBP), BMP, TIFF (II*\0 / MM\0*, which
+// also covers CR2, NEF, ARW, DNG, PEF), HEIC/HEIF (ftyp
+// heic|heix|hevc|mif1|msf1), AVIF (ftyp avif|avis), JPEG XL (FF 0A, or
+// 00 00 00 0C 4A 58 4C 20 0D 0A 87 0A), and the raw files with their own
+// signature: ORF (IIRO, IIRS, MMOR), RW2 (IIU\0), RAF
+// ("FUJIFILMCCD-RAW "), CR3 (ftyp crx).
 // Never uses the file extension.
 func IsImage(path string) bool
 
@@ -177,6 +181,16 @@ package imgload
 // applies EXIF orientation (rwcarlsen/goexif) for JPEG/TIFF/WebP where present.
 // Result is always *image.NRGBA (convert if needed) so the renderer has
 // one fast path. Animated GIF: first frame only.
+// A camera raw file (camraw.Parse says so; checked first, by content, so
+// a raw file with a TIFF header never reaches x/image/tiff) is read only
+// where its structure and preview are, not whole: the image is the
+// largest of its embedded JPEGs that image/jpeg decodes (sensor data
+// stored as lossless JPEG fails and is passed over), held to the same
+// size limit as any image, turned by camraw's Orient exactly once (the
+// JPEG's own Exif orientation is never applied). No such JPEG: IFD0 by
+// x/image/tiff when it is an uncompressed RGB thumbnail (DNG), else the
+// error "no embedded preview in this CR2 file". Sensor data is never
+// demosaiced.
 func Decode(path string) (*image.NRGBA, error)
 
 // Loader is an async LRU cache in front of Decode.
@@ -196,11 +210,13 @@ func (l *Loader) GetMeta(path string) (*image.NRGBA, Meta, error)
 // Meta is what pix reads from a file besides its pixels.
 type Meta struct {
     Taken time.Time // EXIF DateTimeOriginal (fallback: DateTime); zero when absent
+    Raw   string    // camera raw format (camraw.Info.Format) when the image is a
+                    // raw file's embedded preview; "" otherwise
 }
 
 // ReadMeta parses only the EXIF block (JPEG APP1, TIFF, WebP EXIF chunk,
-// HEIC/AVIF where trivially available); never decodes pixels. Errors give
-// a zero Meta.
+// HEIC/AVIF where trivially available; for a raw file, what camraw.Parse
+// reads); never decodes pixels. Errors give a zero Meta.
 func ReadMeta(path string) Meta
 
 // Taken is ReadMeta(path).Taken and whether it is set (scan.Options.Taken).
@@ -217,6 +233,51 @@ func (l *Loader) Invalidate(path string)
 // either cap are evicted; the image last asked for by Get is always kept.
 func (l *Loader) SetByteBudget(n int64)
 ```
+
+### internal/camraw
+
+```go
+package camraw
+
+type Info struct {
+    Format string   // "CR2", "CR3", "NEF", "ARW", "DNG", "PEF", "ORF", "RW2", "RAF",
+                    // or "raw" (another TIFF-based raw file)
+    Orient int      // EXIF orientation (1..8, 1 if absent) the previews are shown with:
+                    // IFD0's (CR3: CMT1's; RAF: its JPEG's Exif). Never a preview's own.
+    Taken  string   // DateTimeOriginal (Exif IFD; CR3 CMT2), else IFD0 DateTime, as stored
+    JPEGs  []Region // embedded JPEGs found (inside the file, starting FF D8 FF), file order
+    Thumb  bool     // IFD0 is an uncompressed RGB image (a DNG thumbnail)
+}
+type Region struct{ Off, Len int64 }
+
+// Parse reports whether r (size bytes) is a camera raw file and describes it.
+func Parse(r io.ReaderAt, size int64) (Info, bool)
+```
+
+Told apart by content only: RAF and CR3 by signature; ORF and RW2 by
+their TIFF-like magic; with a plain TIFF header, CR2 by "CR\x02" at byte
+8, DNG by a DNGVersion tag in IFD0, NEF/ARW/PEF/"raw" by an IFD with a CFA
+or LinearRaw photometric interpretation (named by IFD0's Make). A TIFF
+with none of these is not raw, and decodes as a TIFF as before.
+Where the previews are looked for:
+
+- TIFF-based: the IFD0 chain and SubIFDs (two levels), in each IFD that
+  is not sensor data a JPEGInterchangeFormat/Length pair and a single
+  strip (CR2 IFD0, DNG previews, NEF/ARW/PEF JpgFromRaw); RW2 also IFD0
+  tag 0x2e; ORF the CameraSettings IFD (0x2020) of an "OLYMPUS\0" or
+  "OM SYSTEM" maker note, offsets from the note's start (the old "OLYMP\0"
+  notes are not read).
+- CR3: moov's Canon uuid box (CMT1 = IFD0, CMT2 = Exif IFD), the first
+  sample of each trak (stsz + co64/stco; track 1 is a full-size JPEG),
+  and the PRVW box (1620×1080) in the preview uuid box.
+- RAF: offset and length at bytes 84 and 88 (big-endian); its Exif APP1
+  supplies Orient and Taken.
+
+Offsets and lengths are untrusted: every read is bounds-checked against
+the file (or the enclosing box), at most 64 IFDs of at most 1000 entries
+are visited (each once), a value read is at most 64 KiB, and a CR3 box
+lists at most 256 children. A damaged file gives fewer previews, never a
+panic (fuzzed: FuzzParse).
 
 ### internal/fileops
 
@@ -259,6 +320,9 @@ type CopyResult struct {
 // Anything unexpected in the header (markers, lengths, byte order, IFD
 // bounds; looked for in the first MiB) and every other format: plain
 // copy with RotLost. Whole turns (rot % 4 == 0) are a plain copy.
+// RotLost names a camera raw file by camraw's Format in lower case
+// ("cr2", "nef", "raf", ...), not "tiff"; pix never writes into a raw
+// file or its copy.
 func CopyAll(srcs []string, dir string, rot func(src string) int) []CopyResult
 
 // RotateOrientation returns the EXIF orientation (1..8) that displays like
@@ -545,7 +609,9 @@ One line, small text, left aligned, parts three spaces apart:
 
 The Label, "★" when the image is marked, position, "scanning…" while the
 playlist is still being filled in (statusInfo.Scanning; with no images
-yet it replaces "no images"), dimensions, date taken
+yet it replaces "no images"), dimensions (of a raw file's preview:
+"1616×1080 ARW preview", from Meta.Raw, since it may be smaller than the
+sensor), date taken
 (EXIF, "2006-01-02 15:04", only when present), zoom, rotation (only when
 ≠0), "lock" while the view is locked, "N marked" when N > 0, and a transient
 message (2s). Show `error: <msg>` in place of dims if decode failed (the
@@ -566,7 +632,8 @@ files). It is composed by the pure function statusText (tested headless).
   so a photo marked under the view lock keeps the carried-over one), and
   for the image on screen (not loading, not failed) the rotation it is
   shown with. A rotated JPEG's copy stores it in
-  its EXIF orientation (see fileops); other formats are copied unchanged.
+  its EXIF orientation (see fileops); other formats, raw files included,
+  are copied unchanged.
   The summary adds `(2 rotated)` (copies made with it stored) and
   `, rotation not stored for 1 (png)` (reasons, sorted and deduplicated).
   A file already copied is skipped as before even if it was rotated

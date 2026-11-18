@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/rwcarlsen/goexif/exif"
+
+	"pix/internal/camraw"
 )
 
 // Meta is the metadata pix shows and sorts by.
@@ -16,6 +18,10 @@ type Meta struct {
 	// Taken is the EXIF DateTimeOriginal (falling back to DateTime) in
 	// local time; zero when absent, invalid or all zeros.
 	Taken time.Time
+	// Raw is the camera raw format ("CR2", "NEF", ...; see camraw.Info)
+	// when the file is one, so that the image is its embedded preview;
+	// "" for every other file.
+	Raw string
 }
 
 // metaPrefix bounds how much of a file ReadMeta looks at: segment and
@@ -62,11 +68,20 @@ func metaFrom(r io.ReaderAt, size int64) (m Meta) {
 			m = Meta{}
 		}
 	}()
+	if info, ok := camraw.Parse(r, size); ok {
+		return rawMeta(info)
+	}
 	raw := locateExif(r, size)
 	if raw == nil {
 		return Meta{}
 	}
 	return Meta{Taken: exifTaken(raw)}
+}
+
+// rawMeta is the Meta of a camera raw file.
+func rawMeta(info camraw.Info) Meta {
+	t, _ := parseExifTime(info.Taken)
+	return Meta{Taken: t, Raw: info.Format}
 }
 
 // locateExif returns the EXIF block of an image in a form exif.Decode

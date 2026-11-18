@@ -9,8 +9,9 @@ import (
 	"image"
 	"image/draw"
 	_ "image/gif"
-	_ "image/jpeg"
+	"image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 
 	"github.com/gen2brain/avif"
@@ -18,8 +19,10 @@ import (
 	_ "github.com/gen2brain/jpegxl"
 	"github.com/rwcarlsen/goexif/exif"
 	_ "golang.org/x/image/bmp"
-	_ "golang.org/x/image/tiff"
+	"golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
+
+	"pix/internal/camraw"
 )
 
 // maxPixels guards against headers that would make the decoder allocate
@@ -35,6 +38,10 @@ const maxPixels = 1 << 28 // 268 MP, ~1 GiB as NRGBA
 //
 // HEIC, AVIF and JPEG XL orientation is applied by their decoders. The
 // result's bounds always start at (0,0).
+//
+// A camera raw file (see camraw.Parse; recognised by content before any
+// other format, so one with a TIFF header never reaches x/image/tiff) is
+// shown by its largest embedded JPEG preview: see decodeRaw.
 func Decode(path string) (*image.NRGBA, error) {
 	return decodeFile(path, nil)
 }
@@ -49,7 +56,25 @@ func decodeWithMeta(path string) (*image.NRGBA, Meta, error) {
 }
 
 // decodeFile implements Decode, filling *meta when meta is non-nil.
+// A camera raw file is read only where its structure and preview are;
+// any other file is read whole.
 func decodeFile(path string, meta *Meta) (img *image.NRGBA, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			img, err = nil, fmt.Errorf("decode %s: panic: %v", path, r)
+		}
+	}()
+	if f, err := os.Open(path); err == nil {
+		defer f.Close()
+		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+			if info, ok := camraw.Parse(f, fi.Size()); ok {
+				if meta != nil {
+					*meta = rawMeta(info)
+				}
+				return decodeRaw(f, fi.Size(), info)
+			}
+		}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -57,11 +82,6 @@ func decodeFile(path string, meta *Meta) (img *image.NRGBA, err error) {
 	if meta != nil {
 		*meta = metaFrom(bytes.NewReader(data), int64(len(data)))
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			img, err = nil, fmt.Errorf("decode %s: panic: %v", path, r)
-		}
-	}()
 	m, format, err := decodeBytes(data)
 	if err != nil {
 		return nil, err
@@ -98,6 +118,46 @@ func decodeBytes(data []byte) (image.Image, string, error) {
 		return nil, "", err
 	}
 	return image.Decode(bytes.NewReader(data))
+}
+
+// decodeRaw shows a camera raw file by its largest embedded JPEG that
+// decodes (sensor data is never demosaiced), turned upright by the raw
+// file's orientation. The JPEG's own Exif orientation, which some carry,
+// is not applied as well: that would turn it twice. Without a usable JPEG
+// an uncompressed RGB thumbnail in IFD0 (DNG) is the image.
+func decodeRaw(r io.ReaderAt, size int64, info camraw.Info) (*image.NRGBA, error) {
+	var best camraw.Region
+	var cfg image.Config
+	for _, j := range info.JPEGs {
+		c, err := jpeg.DecodeConfig(io.NewSectionReader(r, j.Off, j.Len))
+		if err == nil && c.Width*c.Height > cfg.Width*cfg.Height {
+			best, cfg = j, c
+		}
+	}
+	var m image.Image
+	var err error
+	switch {
+	case best.Len > 0:
+		if err := checkConfig(cfg, nil); err != nil {
+			return nil, err
+		}
+		buf := make([]byte, best.Len) // within the file: camraw checked
+		if _, err := r.ReadAt(buf, best.Off); err != nil {
+			return nil, err
+		}
+		m, err = jpeg.Decode(bytes.NewReader(buf))
+	case info.Thumb:
+		if err := checkConfig(tiff.DecodeConfig(io.NewSectionReader(r, 0, size))); err != nil {
+			return nil, fmt.Errorf("%s thumbnail: %w", info.Format, err)
+		}
+		m, err = tiff.Decode(io.NewSectionReader(r, 0, size))
+	default:
+		return nil, fmt.Errorf("no embedded preview in this %s file", info.Format)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s preview: %w", info.Format, err)
+	}
+	return orient(toNRGBA(m), info.Orient), nil
 }
 
 func checkConfig(cfg image.Config, err error) error {

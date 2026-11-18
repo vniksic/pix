@@ -410,6 +410,13 @@ func TestCopyRotatedFallsBack(t *testing.T) {
 		{"IFD out of bounds", "i.jpg", withSegments(base, exifSegment(badIFD.data)), "jpeg: unexpected EXIF"},
 		{"truncated", "u.jpg", truncSeg, "jpeg: unexpected header"},
 		{"standalone marker", "s.jpg", rst, "jpeg: unexpected header"},
+		// Camera raw files are named as such, by content, not "tiff",
+		// "heic" or "unknown format".
+		{"cr2", "c.jpg", []byte("II*\x00\x10\x00\x00\x00CR\x02\x00\x00\x00\x00\x00"), "cr2"},
+		{"cr3", "c.tif", []byte("\x00\x00\x00\x18ftypcrx \x00\x00\x00\x01crx isom"), "cr3"},
+		{"orf", "o.raw", []byte("IIRO\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), "orf"},
+		{"raf", "r.raw", []byte("FUJIFILMCCD-RAW 0201FF159501X-T3"), "raf"},
+		{"plain tiff", "t.cr2", []byte("II*\x00\x08\x00\x00\x00\x01\x00\x06\x01\x03\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00"), "tiff"},
 	} {
 		r, out := copyRotated(t, c.file, c.src, 1)
 		if r.Rotated || r.RotLost != c.lost {

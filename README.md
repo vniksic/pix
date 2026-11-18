@@ -18,7 +18,16 @@ binary, no config file, meant to be launched from a terminal.
 
 Files are detected by content, not extension, so PDFs, videos and misnamed
 files never show up in the list. Formats: JPEG (with EXIF orientation), PNG,
-GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL.
+GIF, WebP, TIFF, BMP, HEIC, AVIF, JPEG XL, and camera raw files: Canon CR2
+and CR3, Sony ARW, Nikon NEF, DNG, Pentax PEF, Olympus ORF, Panasonic RW2,
+Fujifilm RAF.
+Of a raw file pix shows the largest JPEG preview the camera embedded in it,
+turned by the raw file's orientation; it does not develop the sensor data.
+That preview is full size for most cameras but smaller for some (older
+Sony bodies 1616×1080, Panasonic 1920×1440, Olympus 3200×2400, Fujifilm
+4416×2944, some phone DNGs about 1280×960), so the status bar says
+`1616×1080 ARW preview` rather than just the size. A raw file without any
+JPEG preview shows an error (or, for a DNG, its small RGB thumbnail).
 Big or slow (network) directories open immediately and the list fills in
 while they are read.
 
@@ -77,8 +86,8 @@ The directory is created on the first copy; if the path is a file, or you
 cannot write there, pix refuses to start.
 A JPEG you rotated with `[` / `]` is copied with its EXIF orientation set,
 so it opens the way you turned it; this is lossless (only that tag
-changes, the image data is copied byte for byte). Other formats are copied
-as they are, and the status line says so.
+changes, the image data is copied byte for byte). Other formats, raw files
+included, are copied as they are, and the status line says so.
 When pix quits (q, Escape, or closing the window) any marked images not
 copied yet are copied too, then the marked paths are printed to stdout, one
 per line, in list order, so they can be piped:

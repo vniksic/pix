@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pix/internal/camraw"
 )
 
 // CopyResult is the outcome of copying one file.
@@ -41,7 +43,8 @@ const maxSuffix = 10000
 // rot, if not nil, gives the clockwise quarter turns a source was viewed
 // with. A JPEG copy then gets the EXIF orientation that shows it turned
 // that way (see orientJPEG; the image data is copied byte for byte);
-// other formats are copied unchanged with RotLost set. The identical-file
+// other formats, camera raw files included, are copied unchanged with
+// RotLost set to the format's name ("png", "cr2", ...). The identical-file
 // check compares against the bytes the copy would hold.
 func CopyAll(srcs []string, dir string, rot func(src string) int) []CopyResult {
 	results := make([]CopyResult, len(srcs))
@@ -105,8 +108,13 @@ func withRotation(f *os.File, size int64, q int) (c content, rotated bool, lost 
 	if n < len(head) && err != nil {
 		return c, false, "read error"
 	}
-	if formatName(head) != "jpeg" {
-		return c, false, formatName(head)
+	if name := formatName(head); name != "jpeg" {
+		// A camera raw file by its own name, not "tiff" (CR2, NEF, ...),
+		// "heic" (CR3) or "unknown format" (ORF, RW2, RAF).
+		if info, ok := camraw.Parse(f, size); ok {
+			name = strings.ToLower(info.Format)
+		}
+		return c, false, name
 	}
 	out, cut, err := orientJPEG(head, q)
 	if err != nil {

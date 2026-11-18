@@ -88,6 +88,7 @@ type viewer struct {
 	loadSlow   bool // loading has taken longer than loadingDelay
 	loadErr    error
 	taken      time.Time // when the shown picture was taken (zero if unknown)
+	rawFormat  string    // the shown picture is the preview in a raw file of this format ("" if not raw)
 	renderedAt time.Time // when the current image (or its error) was put on screen
 	// Paging is gated on display (see gateStep): a next/previous step that
 	// comes too early is kept as pendStep (±1, 0 = none) and run by a timer
@@ -558,10 +559,10 @@ func (u *viewer) loadLoop() {
 			u.renderedAt = time.Now()
 			if err != nil {
 				u.loadErr = err
-				u.taken = time.Time{}
+				u.taken, u.rawFormat = time.Time{}, ""
 				u.vp.SetMessage("cannot show " + e.Label + ": " + err.Error())
 			} else {
-				u.taken = meta.Taken
+				u.taken, u.rawFormat = meta.Taken, meta.Raw
 				u.vp.SetImage(img, opaque)
 				// After SetImage's lock logic, so a remembered rotation
 				// overrides the one the lock carried over.
@@ -924,7 +925,7 @@ func (u *viewer) updateStatus() {
 		if img := u.vp.img; img != nil {
 			b := img.Bounds()
 			s.HasImg, s.W, s.H = true, b.Dx(), b.Dy()
-			s.Taken = u.taken
+			s.Taken, s.Raw = u.taken, u.rawFormat
 			s.Percent, s.Rot = u.vp.view.Percent(), u.vp.view.Rot
 		}
 	}

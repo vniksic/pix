@@ -25,6 +25,7 @@ type statusInfo struct {
 	Err      error
 	HasImg   bool // image details below are valid
 	W, H     int
+	Raw      string    // camera raw format when the image is that file's embedded preview
 	Taken    time.Time // zero when unknown
 	Percent  int
 	Rot      int // clockwise quarter turns
@@ -36,6 +37,8 @@ type statusInfo struct {
 // statusText composes the status line:
 //
 //	label ★   12/87   scanning…   4000×3000   2024-05-01 14:03   33%   ↻90°   lock   3 marked   <flash>
+//
+// The dimensions of a camera raw file's preview read "1616×1080 ARW preview".
 //
 // Parts that do not apply are left out.
 func statusText(s statusInfo) string {
@@ -62,7 +65,11 @@ func statusText(s statusInfo) string {
 		case s.Err != nil:
 			parts = append(parts, "error: "+s.Err.Error())
 		case s.HasImg:
-			parts = append(parts, fmt.Sprintf("%d×%d", s.W, s.H))
+			dims := fmt.Sprintf("%d×%d", s.W, s.H)
+			if s.Raw != "" {
+				dims += " " + s.Raw + " preview" // not the sensor's size
+			}
+			parts = append(parts, dims)
 			if !s.Taken.IsZero() {
 				parts = append(parts, s.Taken.Format(takenLayout))
 			}

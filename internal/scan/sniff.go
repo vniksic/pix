@@ -7,7 +7,9 @@ import (
 )
 
 // IsImage sniffs the first 64 bytes. It recognises JPEG, PNG, GIF, WebP,
-// BMP, TIFF, HEIC/HEIF, AVIF and JPEG XL. It never looks at the extension.
+// BMP, TIFF, HEIC/HEIF, AVIF, JPEG XL and the camera raw files pix shows
+// the preview of: those with a TIFF header (CR2, NEF, ARW, DNG, PEF, ...)
+// and ORF, RW2, RAF and CR3. It never looks at the extension.
 func IsImage(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -25,6 +27,7 @@ func IsImage(path string) bool {
 var isobmffBrands = map[string]bool{
 	"heic": true, "heix": true, "hevc": true, "mif1": true, "msf1": true, // HEIC/HEIF
 	"avif": true, "avis": true, // AVIF
+	"crx ": true, // Canon CR3
 }
 
 func sniff(b []byte) bool {
@@ -36,9 +39,12 @@ func sniff(b []byte) bool {
 		has(0, "\x89PNG\r\n\x1a\n"),
 		has(0, "GIF87a"), has(0, "GIF89a"),
 		has(0, "RIFF") && has(8, "WEBP"),
-		has(0, "II*\x00"), has(0, "MM\x00*"), // TIFF
-		has(0, "\xff\x0a"),                       // JPEG XL codestream
-		has(0, "\x00\x00\x00\x0cJXL \r\n\x87\n"): // JPEG XL container
+		has(0, "II*\x00"), has(0, "MM\x00*"), // TIFF, and raw files built on it
+		has(0, "\xff\x0a"),                             // JPEG XL codestream
+		has(0, "\x00\x00\x00\x0cJXL \r\n\x87\n"),       // JPEG XL container
+		has(0, "IIRO"), has(0, "IIRS"), has(0, "MMOR"), // Olympus ORF
+		has(0, "IIU\x00"),          // Panasonic RW2
+		has(0, "FUJIFILMCCD-RAW "): // Fujifilm RAF
 		return true
 	case has(0, "BM"):
 		return isBMP(b)
