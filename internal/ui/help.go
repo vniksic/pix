@@ -40,7 +40,8 @@ var helpGroups = [][]helpRow{
 		{"o", "open the file in another program ($PIX_OPEN, else xdg-open)"},
 	},
 	{
-		{"Ctrl+C", "copy image to clipboard (as displayed)"},
+		{"Ctrl+C", "copy image to clipboard (as displayed; scaled down if over 15 MB)"},
+		{"Ctrl+Alt+C", "copy image to clipboard at full size, however large"},
 		{"Ctrl+Shift+C", "copy file path to clipboard"},
 	},
 	{

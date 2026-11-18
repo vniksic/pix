@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"math"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
+
+	xdraw "golang.org/x/image/draw"
 )
 
 var ErrNoBackend = errors.New("clipboard: neither wl-copy nor xclip found")
@@ -25,19 +28,51 @@ var (
 	exitWait     = time.Second
 )
 
+// PasteLimit is a PNG size apps accept as a paste (WhatsApp Web refuses
+// 16 MB and up); a big photo easily triples in size as PNG.
+const PasteLimit = 15_000_000
+
 // CopyImage PNG-encodes img and hands it to the system clipboard.
 // Backend selection: if $WAYLAND_DISPLAY is set and wl-copy is in PATH ->
 // `wl-copy --type image/png` (stdin). Else if xclip in PATH ->
 // `xclip -selection clipboard -t image/png -i`. Else ErrNoBackend.
-func CopyImage(img image.Image) error {
-	var buf bytes.Buffer
-	enc := png.Encoder{CompressionLevel: png.BestSpeed}
-	if err := enc.Encode(&buf, img); err != nil {
-		return fmt.Errorf("clipboard: encode png: %w", err)
+// With limit > 0 a PNG over limit bytes is redone from img scaled down
+// until it fits; the returned size is that of the image actually copied.
+func CopyImage(img image.Image, limit int) (image.Point, error) {
+	data, size, err := encodePNG(img, limit)
+	if err != nil {
+		return image.Point{}, err
 	}
-	return copyData(buf.Bytes(),
+	return size, copyData(data,
 		[]string{"--type", "image/png"},
 		[]string{"-selection", "clipboard", "-t", "image/png", "-i"})
+}
+
+// encodePNG encodes img, scaling it down while the PNG exceeds limit
+// (when limit > 0).
+// PNG size grows roughly with pixel count, so each retry shrinks the
+// area by the overshoot plus a margin. Every retry scales from img itself.
+func encodePNG(img image.Image, limit int) ([]byte, image.Point, error) {
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	src := img
+	for {
+		var buf bytes.Buffer
+		if err := enc.Encode(&buf, src); err != nil {
+			return nil, image.Point{}, fmt.Errorf("clipboard: encode png: %w", err)
+		}
+		size := src.Bounds().Size()
+		if limit <= 0 || buf.Len() <= limit {
+			return buf.Bytes(), size, nil
+		}
+		f := 0.95 * math.Sqrt(float64(limit)/float64(buf.Len()))
+		w, h := int(float64(size.X)*f), int(float64(size.Y)*f)
+		if w < 1 || h < 1 {
+			return nil, image.Point{}, fmt.Errorf("clipboard: cannot fit image in %d bytes", limit)
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, w, h))
+		xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Src, nil)
+		src = dst
+	}
 }
 
 // CopyText puts s on the clipboard with the same backend selection

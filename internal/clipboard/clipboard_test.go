@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +51,7 @@ func testImage() *image.NRGBA {
 func TestCopyImageWayland(t *testing.T) {
 	out := fakeTools(t, "", "wl-copy", "xclip")
 	t.Setenv("WAYLAND_DISPLAY", "wayland-1")
-	if err := CopyImage(testImage()); err != nil {
+	if _, err := CopyImage(testImage(), PasteLimit); err != nil {
 		t.Fatal(err)
 	}
 	if got := readOut(t, out, "wl-copy.args"); got != "--type\nimage/png\n" {
@@ -71,7 +72,7 @@ func TestCopyImageWayland(t *testing.T) {
 func TestCopyImageX11(t *testing.T) {
 	out := fakeTools(t, "", "wl-copy", "xclip")
 	t.Setenv("WAYLAND_DISPLAY", "")
-	if err := CopyImage(testImage()); err != nil {
+	if _, err := CopyImage(testImage(), PasteLimit); err != nil {
 		t.Fatal(err)
 	}
 	if got := readOut(t, out, "xclip.args"); got != "-selection\nclipboard\n-t\nimage/png\n-i\n" {
@@ -114,7 +115,7 @@ func TestNoBackend(t *testing.T) {
 	if err := CopyText("x"); !errors.Is(err, ErrNoBackend) {
 		t.Errorf("CopyText err = %v", err)
 	}
-	if err := CopyImage(testImage()); !errors.Is(err, ErrNoBackend) {
+	if _, err := CopyImage(testImage(), PasteLimit); !errors.Is(err, ErrNoBackend) {
 		t.Errorf("CopyImage err = %v", err)
 	}
 }
@@ -188,5 +189,53 @@ func TestToolRunsInOwnSession(t *testing.T) {
 	}
 	if got, ours := sessionOf(t, readOut(t, out, "stat")), sessionOf(t, string(self)); got == ours {
 		t.Errorf("clipboard tool shares our session %s; a signal to our group would kill the selection owner", ours)
+	}
+}
+
+// An image whose PNG exceeds the limit is scaled down, keeping its aspect,
+// until the PNG fits; the reported size is what landed on the clipboard.
+func TestCopyImageScalesDownOversize(t *testing.T) {
+	out := fakeTools(t, "", "wl-copy")
+	t.Setenv("WAYLAND_DISPLAY", "wayland-1")
+	const limit = 20000
+
+	m := image.NewNRGBA(image.Rect(0, 0, 300, 200))
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range m.Pix {
+		m.Pix[i] = byte(rng.UintN(256))
+		if i%4 == 3 {
+			m.Pix[i] = 255
+		}
+	}
+	size, err := CopyImage(m, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := readOut(t, out, "wl-copy.stdin")
+	if len(data) > limit {
+		t.Errorf("PNG is %d bytes, cap %d", len(data), limit)
+	}
+	got, err := png.Decode(strings.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bounds().Size() != size {
+		t.Errorf("reported size %v, clipboard holds %v", size, got.Bounds().Size())
+	}
+	if size.X >= 300 || size.X*2 < size.Y*3-3 || size.X*2 > size.Y*3+3 {
+		t.Errorf("size %v: want smaller than 300×200 with 3:2 aspect", size)
+	}
+
+	size, err = CopyImage(testImage(), limit)
+	if err != nil || size != testImage().Bounds().Size() {
+		t.Errorf("small image: size %v err %v, want unscaled", size, err)
+	}
+
+	size, err = CopyImage(m, 0)
+	if err != nil || size != m.Bounds().Size() {
+		t.Errorf("no limit: size %v err %v, want unscaled", size, err)
+	}
+	if n := len(readOut(t, out, "wl-copy.stdin")); n <= limit {
+		t.Errorf("no limit: PNG is %d bytes, want the full-size one over %d", n, limit)
 	}
 }

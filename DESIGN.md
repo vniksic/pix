@@ -292,10 +292,13 @@ package clipboard
 // Backend selection: if $WAYLAND_DISPLAY is set and wl-copy is in PATH ->
 //   `wl-copy --type image/png` (stdin). Else if xclip in PATH ->
 //   `xclip -selection clipboard -t image/png -i`. Else ErrNoBackend.
+// With limit > 0 a PNG over limit bytes is redone from img scaled down
+// until it fits; returns the copied size. Ctrl+C passes PasteLimit (15 MB:
+// WhatsApp Web refuses 16 MB+ pastes), Ctrl+Alt+C passes 0.
 // Both tools fork and keep serving the selection after we return, which is
 // what X11/Wayland require. Do not wait on the child beyond stdin close +
 // a short timeout; wl-copy may legitimately stay alive.
-func CopyImage(img image.Image) error
+func CopyImage(img image.Image, limit int) (image.Point, error)
 
 // CopyText puts s on the clipboard with the same backend selection
 // (wl-copy / xclip -selection clipboard).
@@ -438,7 +441,8 @@ the displayed rotation, so it includes the remembered one.
     x                             Fit
     + / = / -                     zoom in / out (×1.25 steps), around viewport centre
     [ / ]                         rotate 90° CCW / CW (view only), stays in current mode (re-fit if Fit); remembered per photo for the session
-    Ctrl+C                        copy image to clipboard (PNG, *as displayed rotation applied*)
+    Ctrl+C                        copy image to clipboard (PNG, *as displayed rotation applied*, scaled down if over 15 MB)
+    Ctrl+Alt+C                    as Ctrl+C but never scaled down
     Ctrl+Shift+C                  copy absolute path as text
     Tab, b                        toggle sidebar (both; Fyne may eat Tab for focus)
     r                             rescan directory now

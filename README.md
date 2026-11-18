@@ -34,7 +34,8 @@ while they are read.
 | x                                | fit to window                            |
 | + / = / -                        | zoom in / out                            |
 | [ / ]                            | rotate 90° left / right (view only; remembered per photo for the session) |
-| Ctrl+C                           | copy image to clipboard (as displayed)   |
+| Ctrl+C                           | copy image to clipboard (as displayed; scaled down if over 15 MB) |
+| Ctrl+Alt+C                       | copy image to clipboard at full size, however large |
 | Ctrl+Shift+C                     | copy file path to clipboard              |
 | Tab, b                           | toggle the file list                     |
 | r                                | rescan the directory                     |
@@ -140,7 +141,10 @@ The binary links only libc, libGL, libwayland-client, libX11 and libffi,
 all present on any Linux desktop, so it can be copied between machines.
 
 Clipboard copy uses `wl-copy` on Wayland and `xclip` on X11; install
-`wl-clipboard` or `xclip` if Ctrl+C reports no backend.
+`wl-clipboard` or `xclip` if Ctrl+C reports no backend. The image goes
+over as PNG; when that would exceed 15 MB (WhatsApp Web, for one, refuses
+pastes of 16 MB or more) it is scaled down until it fits, and the status
+bar says so. Ctrl+Alt+C always copies the full size.
 
 Fyne picks Wayland when `WAYLAND_DISPLAY` is set and X11 otherwise. Set
 `FYNE_PLATFORM=x11` or `FYNE_PLATFORM=wayland` to force one.

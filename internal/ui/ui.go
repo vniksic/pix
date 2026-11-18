@@ -58,6 +58,7 @@ const (
 var (
 	shortcutCopyPath = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl | fyne.KeyModifierShift}
 	shortcutCtrlC    = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl}
+	shortcutCopyFull = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierControl | fyne.KeyModifierAlt}
 )
 
 type viewer struct {
@@ -367,6 +368,7 @@ func (u *viewer) build() {
 	c.AddShortcut(&fyne.ShortcutCut{}, u.typedShortcut)
 	c.AddShortcut(shortcutCtrlC, u.typedShortcut)
 	c.AddShortcut(shortcutCopyPath, u.typedShortcut)
+	c.AddShortcut(shortcutCopyFull, u.typedShortcut)
 	u.focusViewport()
 }
 
@@ -1182,7 +1184,9 @@ func (u *viewer) typedShortcut(s fyne.Shortcut) {
 	}
 	switch s.ShortcutName() {
 	case (&fyne.ShortcutCopy{}).ShortcutName(), shortcutCtrlC.ShortcutName():
-		u.copyImage()
+		u.copyImage(clipboard.PasteLimit)
+	case shortcutCopyFull.ShortcutName():
+		u.copyImage(0)
 	case shortcutCopyPath.ShortcutName():
 		u.copyPath()
 	}
@@ -1190,19 +1194,28 @@ func (u *viewer) typedShortcut(s fyne.Shortcut) {
 
 // ---- clipboard ----
 
-// copyJob is one clipboard hand-off; ok is flashed when it succeeds.
+// copyJob is one clipboard hand-off; run returns the message flashed when
+// it succeeds.
 type copyJob struct {
-	run func() error
-	ok  string
+	run func() (string, error)
 }
 
-func (u *viewer) copyImage() {
+// copyImage copies the image as displayed, scaled down if its PNG would
+// exceed limit bytes (0: never).
+func (u *viewer) copyImage(limit int) {
 	img, rot := u.vp.img, u.vp.view.Rot
 	if img == nil {
 		u.flashMsg("nothing to copy")
 		return
 	}
-	u.requestCopy(&copyJob{run: func() error { return clipboard.CopyImage(RotateNRGBA(img, rot)) }, ok: "copied"})
+	u.requestCopy(&copyJob{run: func() (string, error) {
+		m := RotateNRGBA(img, rot)
+		size, err := clipboard.CopyImage(m, limit)
+		if size != m.Bounds().Size() {
+			return fmt.Sprintf("copied, scaled to %d×%d to stay under 15 MB (Ctrl+Alt+C: full size)", size.X, size.Y), err
+		}
+		return "copied", err
+	}})
 }
 
 func (u *viewer) copyPath() {
@@ -1210,7 +1223,7 @@ func (u *viewer) copyPath() {
 		return
 	}
 	p := u.entries[u.idx].Path
-	u.requestCopy(&copyJob{run: func() error { return clipboard.CopyText(p) }, ok: "copied path"})
+	u.requestCopy(&copyJob{run: func() (string, error) { return "copied path", clipboard.CopyText(p) }})
 }
 
 // requestCopy queues j on the single copy goroutine. A request still
@@ -1244,7 +1257,7 @@ func (u *viewer) copyLoop() {
 		}
 		u.copyMu.Unlock()
 
-		err := j.run()
+		ok, err := j.run()
 		u.copyMu.Lock()
 		superseded := u.copyPending != nil
 		u.copyMu.Unlock()
@@ -1259,7 +1272,7 @@ func (u *viewer) copyLoop() {
 			if err != nil {
 				u.flashMsg("copy failed: " + err.Error())
 			} else {
-				u.flashMsg(j.ok)
+				u.flashMsg(ok)
 			}
 		})
 	}
